@@ -73,6 +73,7 @@
 - **自动更新检查**：启动时会检查项目是否有新版本，并给出提示。
 - **本地 WebUI**：通过浏览器使用单课程下载、批量下载、命令行输出、登录设置和本地视频查看功能。
 - **双视角同步播放**：可同时播放同一节课的 `pptVideo` 和 `teacherTrack`，使用公共进度条同步控制，并可切换声音轨道。
+- **双视角 GPU 导出**：可把两个视角合成为单个视频；检测到 NVIDIA 显卡时优先使用 `h264_nvenc`，否则自动回退到受限线程的软件编码。
 - **字幕支持**：自动识别本地 `.srt` / `.vtt` 字幕，支持字幕偏移、字号和粗体设置。
 - **扫码登录**：支持使用学在西电 App 扫码登录并自动保存登录 Cookies。
 - **访问控制与主题适配**：可设置 WebUI 访问密码和允许访问的客户端网段，并支持系统深色模式。
@@ -210,7 +211,7 @@ python WebUI.py --host 0.0.0.0
 
 ```shell
 # 用法
-python XDUClassVideoDownloader.py [LIVEID] [-s | -ss] [--no-merge] [--video-type {both,ppt,teacher}] [--skip-weeks WEEKS] [--debug]
+python XDUClassVideoDownloader.py [LIVEID] [-s | -ss] [--no-merge] [--video-type {both,ppt,teacher,combined}] [--weeks WEEKS] [--dates DATES] [--lessons LESSONS] [--skip-weeks WEEKS] [--debug]
 ```
 
 - `LIVEID` (可选): 课程的 `liveId`。如果省略，将进入交互模式。
@@ -227,6 +228,9 @@ python XDUClassVideoDownloader.py [LIVEID] [-s | -ss] [--no-merge] [--video-type
   - 范围：`--skip-weeks 1-5` （跳过第1到5周）
   - 逗号分隔：`--skip-weeks "1,3,5"` （跳过第1、3、5周）
   - 组合：`--skip-weeks "1-3,7,9-11"` （跳过1-3周、第7周、9-11周）
+- `--weeks WEEKS` (可选): 只下载指定周次，格式与 `--skip-weeks` 相同。
+- `--dates DATES` (可选): 只下载指定月日，如 `--dates "9-11,10-16"`。
+- `--lessons LESSONS` (可选): 只下载指定节次，如 `--lessons "5-6,9"`。周次、日期和节次同时填写时必须同时匹配。
 - `--debug` (可选): 启用调试日志（写入 `logs/debug.log`）。
 
 **示例:**
@@ -243,13 +247,16 @@ XDUClassVideoDownloader.exe 1234567890 --skip-weeks 1-5
 
 # 跳过第1、3、5周和第7-9周
 XDUClassVideoDownloader.exe 1234567890 --skip-weeks "1,3,5,7-9"
+
+# 只下载第6周、10月16日、第5-6节
+XDUClassVideoDownloader.exe 1234567890 --weeks 6 --dates 10-16 --lessons 5-6
 ```
 
 ### `Automation.py` 参数
 
 ```shell
 # 用法
-python Automation.py [-u UID] [-y YEAR] [-t TERM] [--video-type {both,ppt,teacher}] [--debug]
+python Automation.py [-u UID] [-y YEAR] [-t TERM] [--video-type {both,ppt,teacher,combined}] [--weeks WEEKS] [--dates DATES] [--lessons LESSONS] [--debug]
 ```
 
 - `-u UID` (可选): 您的超星 `UID`。
@@ -259,6 +266,7 @@ python Automation.py [-u UID] [-y YEAR] [-t TERM] [--video-type {both,ppt,teache
   - `both`: 下载两种视频（pptVideo 和 teacherTrack，默认）
   - `ppt`: 仅下载 pptVideo（课件视频）
   - `teacher`: 仅下载 teacherTrack（教师视频）
+- `--weeks`、`--dates`、`--lessons` (可选): 对所有选中课程应用与服务端相同的周次、月日、节次筛选。
 - `--debug` (可选): 启用调试日志（写入 `logs/debug.log`）。
 
 **示例:**
