@@ -20,7 +20,7 @@ import os
 import stat
 import sys
 from pathlib import Path
-from typing import Callable, Optional, Set, Union
+from typing import Callable, Optional, Set, Tuple, Union
 
 # 第三方库导入
 import psutil
@@ -564,3 +564,62 @@ def parse_week_ranges(week_str: str) -> Set[int]:
                 raise ValueError(f"无效的周数: {part}")
 
     return weeks
+
+
+def parse_date_ranges(date_str: str) -> Set[Tuple[int, int]]:
+    """Parse month-day selectors such as ``9-11,10-16``."""
+
+    if not date_str or not date_str.strip():
+        return set()
+
+    dates: Set[Tuple[int, int]] = set()
+    for part in date_str.strip().split(","):
+        part = part.strip()
+        if not part:
+            continue
+        pieces = part.split("-")
+        if len(pieces) != 2:
+            raise ValueError(f"日期格式应为“月-日”: {part}")
+        try:
+            month, day = (int(piece.strip()) for piece in pieces)
+        except ValueError as exc:
+            raise ValueError(f"无效的日期: {part}") from exc
+        if not 1 <= month <= 12:
+            raise ValueError(f"月份必须在 1-12 之间: {part}")
+        if not 1 <= day <= 31:
+            raise ValueError(f"日期必须在 1-31 之间: {part}")
+        dates.add((month, day))
+    return dates
+
+
+def parse_lesson_ranges(lesson_str: str) -> Set[int]:
+    """Parse lesson selectors such as ``5-6,9`` into concrete lesson numbers."""
+
+    if not lesson_str or not lesson_str.strip():
+        return set()
+
+    lessons: Set[int] = set()
+    for part in lesson_str.strip().split(","):
+        part = part.strip()
+        if not part:
+            continue
+        if "-" in part:
+            pieces = part.split("-")
+            if len(pieces) != 2:
+                raise ValueError(f"无效的节次范围: {part}")
+            try:
+                start, end = (int(piece.strip()) for piece in pieces)
+            except ValueError as exc:
+                raise ValueError(f"无效的节次: {part}") from exc
+            if start <= 0 or end <= 0 or start > end:
+                raise ValueError(f"无效的节次范围: {part}")
+            lessons.update(range(start, end + 1))
+        else:
+            try:
+                lesson = int(part)
+            except ValueError as exc:
+                raise ValueError(f"无效的节次: {part}") from exc
+            if lesson <= 0:
+                raise ValueError(f"节次必须是正整数: {part}")
+            lessons.add(lesson)
+    return lessons

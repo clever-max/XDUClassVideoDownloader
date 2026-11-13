@@ -10,3 +10,6 @@ class CourseDownloadOptions:
     merge: bool = True
     video_type: str = "both"
     skip_weeks: str = ""
+    weeks: str = ""
+    dates: str = ""
+    lessons: str = ""

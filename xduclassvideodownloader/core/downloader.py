@@ -25,6 +25,7 @@ import csv
 import logging
 import math
 import os
+import random
 import re
 import shutil
 import stat
@@ -34,11 +35,13 @@ import tempfile
 import threading
 import time
 from contextlib import closing
+from functools import lru_cache
 from pathlib import Path
 from threading import Lock
-from typing import Any, Dict, List, Mapping, Optional, Sequence, Set, Tuple, Union
+from typing import Any, Callable, Dict, List, Mapping, Optional, Sequence, Set, Tuple, Union
 
 # 第三方库导入
+import psutil
 import requests
 from tqdm import tqdm
 
@@ -60,6 +63,7 @@ from .utils import (
     get_app_path,
     get_safe_filename,
     handle_exception,
+    parse_lesson_ranges,
     remove_invalid_chars,
     setup_logging,
 )
@@ -73,12 +77,16 @@ logger = setup_logging("downloader")
 # 下载配置常量
 # ============================================================================
 
-CHUNK_SIZE = 8192  # 下载块大小（字节）
+CHUNK_SIZE = 256 * 1024  # 下载块大小（字节）
 DOWNLOAD_TIMEOUT = 60  # 下载超时时间（秒）
 MAX_DOWNLOAD_RETRIES = 3  # 最大下载重试次数
 MIN_FILE_SIZE = 1024  # 最小有效文件大小（字节）
-MAX_THREADS_PER_FILE = 32  # 每个文件的最大并发分片数
+MAX_THREADS_PER_FILE = 8  # 每个文件的最大并发 Range 请求数
+MAX_RANGE_PARTS = 32  # 保持分片编号稳定，便于跨运行续传
 MIN_SIZE_FOR_MULTITHREAD = 10 * 1024 * 1024  # 启用多线程下载的最小文件大小（10MB）
+RANGE_PART_RETRIES = 3  # 每个 Range 分片的独立重试次数
+RANGE_RETRY_BASE_DELAY = 0.75  # Range 重试的基础退避时间（秒）
+VIDEO_ENCODER_OVERRIDE = "XDU_VIDEO_ENCODER"
 SUBTITLE_EXTENSION = ".srt"
 
 
@@ -632,6 +640,147 @@ def get_ffmpeg_path() -> str:
 # ============================================================================
 
 
+def _range_part_path(temp_path: Path, index: int) -> Path:
+    return temp_path.with_suffix(f".part{index}")
+
+
+def _download_range_part(
+    url: str,
+    headers: Mapping[str, str],
+    index: int,
+    start: int,
+    end: int,
+    part_path: Path,
+    record_bytes: Callable[[int], None],
+    max_attempts: int = RANGE_PART_RETRIES,
+) -> bool:
+    """Download one resumable byte range without discarding completed parts."""
+
+    expected_size = end - start + 1
+    existing = part_path.stat().st_size if part_path.exists() else 0
+    if existing > expected_size:
+        part_path.unlink(missing_ok=True)
+        existing = 0
+    if existing == expected_size:
+        return True
+
+    session = requests.Session()
+    headers_local = dict(headers)
+    headers_local["Accept-Encoding"] = "identity"
+    try:
+        for attempt in range(max_attempts):
+            existing = part_path.stat().st_size if part_path.exists() else 0
+            if existing >= expected_size:
+                return existing == expected_size
+            request_start = start + existing
+            headers_local["Range"] = f"bytes={request_start}-{end}"
+            try:
+                with session.get(
+                    url,
+                    headers=headers_local,
+                    stream=True,
+                    timeout=DOWNLOAD_TIMEOUT,
+                ) as response:
+                    response.raise_for_status()
+                    if response.status_code != 206:
+                        raise RuntimeError("服务器未返回 206 Partial Content")
+                    content_range = response.headers.get("Content-Range", "")
+                    if content_range and not content_range.lower().startswith(
+                        f"bytes {request_start}-"
+                    ):
+                        raise RuntimeError(f"Content-Range 不匹配: {content_range}")
+
+                    with open(part_path, "ab", buffering=1024 * 1024) as part_file:
+                        for chunk in response.iter_content(chunk_size=CHUNK_SIZE):
+                            if not chunk:
+                                continue
+                            part_file.write(chunk)
+                            record_bytes(len(chunk))
+
+                actual_size = part_path.stat().st_size if part_path.exists() else 0
+                if actual_size != expected_size:
+                    raise RuntimeError(
+                        f"分片大小不完整: {actual_size}/{expected_size}"
+                    )
+                return True
+            except Exception as exc:
+                if attempt >= max_attempts - 1:
+                    logger.warning(
+                        f"分片 {index} 最终失败 ({attempt + 1}/{max_attempts}): {exc}"
+                    )
+                    return False
+                delay = RANGE_RETRY_BASE_DELAY * (2 ** attempt)
+                delay += random.uniform(0, delay * 0.25)
+                logger.warning(
+                    f"分片 {index} 下载失败，{delay:.2f}s 后重试 "
+                    f"({attempt + 1}/{max_attempts}): {exc}"
+                )
+                time.sleep(delay)
+    finally:
+        session.close()
+    return False
+
+
+def _run_range_phase(
+    parts: Sequence[Tuple[int, int, int]],
+    max_workers: int,
+    url: str,
+    headers: Mapping[str, str],
+    temp_path: Path,
+    downloaded_total: Dict[str, int],
+    downloaded_lock: Lock,
+    progress_callback: Callable[[int], None],
+) -> List[int]:
+    """Download a set of ranges with bounded concurrency and live progress."""
+
+    if not parts:
+        return []
+
+    def record_bytes(size: int) -> None:
+        with downloaded_lock:
+            downloaded_total["value"] += size
+
+    futures = {}
+    with concurrent.futures.ThreadPoolExecutor(
+        max_workers=max(1, min(max_workers, len(parts)))
+    ) as executor:
+        for index, start, end in parts:
+            future = executor.submit(
+                _download_range_part,
+                url,
+                headers,
+                index,
+                start,
+                end,
+                _range_part_path(temp_path, index),
+                record_bytes,
+            )
+            futures[future] = index
+
+        pending = set(futures)
+        with downloaded_lock:
+            previous = downloaded_total["value"]
+        while pending:
+            done, pending = concurrent.futures.wait(
+                pending,
+                timeout=0.25,
+                return_when=concurrent.futures.FIRST_COMPLETED,
+            )
+            with downloaded_lock:
+                current = downloaded_total["value"]
+            if current > previous:
+                progress_callback(current - previous)
+                previous = current
+
+        with downloaded_lock:
+            current = downloaded_total["value"]
+        if current > previous:
+            progress_callback(current - previous)
+
+    return [index for future, index in futures.items() if not future.result()]
+
+
+
 def download_mp4(
     url: str,
     filename: str,
@@ -733,111 +882,85 @@ def download_mp4(
             )
 
             if use_multithread:
-                num_threads = min(MAX_THREADS_PER_FILE, max(1, math.ceil(total_size / MIN_SIZE_FOR_MULTITHREAD)))
-                num_threads = min(num_threads, MAX_THREADS_PER_FILE)
-                part_size = total_size // num_threads
-                part_paths = [temp_path.with_suffix(f".part{idx}") for idx in range(num_threads)]
+                # Keep part indices stable across runs so interrupted downloads can resume.
+                num_parts = min(
+                    MAX_RANGE_PARTS,
+                    max(1, math.ceil(total_size / MIN_SIZE_FOR_MULTITHREAD)),
+                )
+                max_workers = min(MAX_THREADS_PER_FILE, num_parts)
+                part_size = total_size // num_parts
+                part_paths = [_range_part_path(temp_path, idx) for idx in range(num_parts)]
+                parts = []
+                for index in range(num_parts):
+                    start = index * part_size
+                    end = (
+                        start + part_size - 1
+                        if index < num_parts - 1
+                        else total_size - 1
+                    )
+                    parts.append((index, start, end))
+
+                # A previous single-thread attempt must not overlap the part files.
+                if temp_path.exists():
+                    temp_path.unlink(missing_ok=True)
+
                 downloaded_lock = threading.Lock()
-                downloaded_total = {"value": 0}
-                fail_parts = []
+                existing_bytes = 0
+                for index, start, end in parts:
+                    part_path = part_paths[index]
+                    if not part_path.exists():
+                        continue
+                    expected_size = end - start + 1
+                    actual_size = part_path.stat().st_size
+                    if actual_size > expected_size:
+                        part_path.unlink(missing_ok=True)
+                    else:
+                        existing_bytes += actual_size
+                downloaded_total = {"value": existing_bytes}
+                logger.info(
+                    f"Range 下载使用 {max_workers} 个并发连接，共 {num_parts} 个分片"
+                )
+                with tqdm(
+                    total=total_size,
+                    initial=existing_bytes,
+                    desc=safe_filename,
+                    unit="B",
+                    unit_scale=True,
+                    leave=False,
+                ) as pbar:
+                    fail_parts = _run_range_phase(
+                        parts,
+                        max_workers,
+                        url,
+                        headers,
+                        temp_path,
+                        downloaded_total,
+                        downloaded_lock,
+                        pbar.update,
+                    )
+                    if fail_parts:
+                        logger.warning(
+                            f"检测到 {len(fail_parts)} 个分片失败，保留已下载数据并改为顺序重试"
+                        )
+                        retry_parts = [parts[index] for index in fail_parts]
+                        fail_parts = _run_range_phase(
+                            retry_parts,
+                            1,
+                            url,
+                            headers,
+                            temp_path,
+                            downloaded_total,
+                            downloaded_lock,
+                            pbar.update,
+                        )
 
-                def worker(idx, start, end, part_path):
-                    headers_local = headers.copy()
-                    headers_local["Range"] = f"bytes={start}-{end}"
-                    attempts_local = 0
-                    while attempts_local < max_attempts:
-                        try:
-                            logger.debug(f"GET {url} Range={start}-{end} (part {idx})")
-                            with requests.get(url, headers=headers_local, stream=True, timeout=DOWNLOAD_TIMEOUT) as r:
-                                r.raise_for_status()
-                                with open(part_path, "wb") as pf:
-                                    for chunk in r.iter_content(chunk_size=CHUNK_SIZE):
-                                        if chunk:
-                                            pf.write(chunk)
-                                            with downloaded_lock:
-                                                downloaded_total["value"] += len(chunk)
-                            return True
-                        except Exception as e:
-                            attempts_local += 1
-                            logger.warning(f"分片 {idx} 下载失败，重试 {attempts_local}/{max_attempts}: {e}")
-                    fail_parts.append(idx)
-                    return False
-
-                # start threads
-                threads = []
-                for i in range(num_threads):
-                    start = i * part_size
-                    end = (start + part_size - 1) if i < num_threads - 1 else (total_size - 1)
-                    t = threading.Thread(target=worker, args=(i, start, end, part_paths[i]), daemon=True)
-                    threads.append(t)
-                    t.start()
-
-                # show progress
-                with tqdm(total=total_size, desc=safe_filename, unit="B", unit_scale=True, leave=False) as pbar:
-                    prev = 0
-                    while any(t.is_alive() for t in threads):
-                        with downloaded_lock:
-                            cur = downloaded_total["value"]
-                        delta = cur - prev
-                        if delta > 0:
-                            pbar.update(delta)
-                            prev = cur
-                        for t in threads:
-                            t.join(timeout=0.1)
-                    # final update
-                    with downloaded_lock:
-                        cur = downloaded_total["value"]
-                    if cur - prev > 0:
-                        pbar.update(cur - prev)
-
-                # ensure threads finished
-                for t in threads:
-                    if t.is_alive():
-                        t.join()
-
-                # 如果有失败的分片，回退到单线程下载
                 if fail_parts:
-                    logger.warning(f"检测到 {len(fail_parts)} 个分片下载失败，回退到单线程下载：{fail_parts}")
-                    # 清理已下载分片
-                    for p in part_paths:
-                        if p.exists():
-                            try:
-                                p.unlink()
-                            except Exception:
-                                pass
-                    # 改为普通单线程下载逻辑（与下面 else 分支基本相同）
-                    if temp_path.exists():
-                        try:
-                            temp_path.unlink()
-                        except Exception:
-                            pass
-
-                    logger.debug(f"GET {url} (fallback single-thread after parts) ")
-                    with closing(requests.get(url, headers=headers, stream=True, timeout=DOWNLOAD_TIMEOUT)) as response:
-                        response.raise_for_status()
-                        if total_size == 0:
-                            total_size = int(response.headers.get("content-length", 0) or 0)
-                        downloaded_size = 0
-                        with open(temp_path, "wb") as f:
-                            if total_size > 0:
-                                with tqdm(
-                                    total=total_size, unit="B", unit_scale=True, desc=safe_filename, leave=False
-                                ) as pbar:
-                                    for chunk in response.iter_content(chunk_size=CHUNK_SIZE):
-                                        if chunk:
-                                            f.write(chunk)
-                                            downloaded_size += len(chunk)
-                                            pbar.update(len(chunk))
-                            else:
-                                with tqdm(unit="B", unit_scale=True, desc=safe_filename, leave=False) as pbar:
-                                    for chunk in response.iter_content(chunk_size=CHUNK_SIZE):
-                                        if chunk:
-                                            f.write(chunk)
-                                            downloaded_size += len(chunk)
-                                            pbar.update(len(chunk))
+                    raise RuntimeError(
+                        f"仍有 {len(fail_parts)} 个分片失败，已保留分片供下次续传"
+                    )
                 else:
                     # 合并分片到临时文件
-                    with open(temp_path, "wb") as out_f:
+                    with open(temp_path, "wb", buffering=1024 * 1024) as out_f:
                         for p in part_paths:
                             if not p.exists():
                                 raise Exception(f"缺失分片文件: {p}")
@@ -1018,6 +1141,78 @@ def check_ffmpeg_availability() -> bool:
         return False
 
 
+@lru_cache(maxsize=8)
+def _ffmpeg_supports_encoder(encoder: str) -> bool:
+    try:
+        result = subprocess.run(
+            [get_ffmpeg_path(), "-hide_banner", "-encoders"],
+            check=True,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=15,
+        )
+        return bool(re.search(rf"\b{re.escape(encoder)}\b", result.stdout))
+    except Exception:
+        return False
+
+
+def _preferred_video_encoder() -> str:
+    override = os.environ.get(VIDEO_ENCODER_OVERRIDE, "").strip()
+    if override:
+        return override
+    if _ffmpeg_supports_encoder("h264_nvenc"):
+        return "h264_nvenc"
+    return "libx264"
+
+
+def _run_ffmpeg_background(
+    command: Sequence[str], timeout: int
+) -> subprocess.CompletedProcess:
+    """Run FFmpeg below normal priority so the desktop stays responsive."""
+
+    process = subprocess.Popen(
+        list(command),
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+    )
+    try:
+        try:
+            child = psutil.Process(process.pid)
+            if os.name == "nt":
+                child.nice(
+                    getattr(
+                        psutil,
+                        "BELOW_NORMAL_PRIORITY_CLASS",
+                        psutil.NORMAL_PRIORITY_CLASS,
+                    )
+                )
+            else:
+                child.nice(5)
+        except (psutil.Error, OSError):
+            pass
+        stdout, stderr = process.communicate(timeout=timeout)
+    except subprocess.TimeoutExpired:
+        process.kill()
+        process.communicate()
+        raise
+
+    if process.returncode:
+        raise subprocess.CalledProcessError(
+            process.returncode,
+            list(command),
+            output=stdout,
+            stderr=stderr,
+        )
+    return subprocess.CompletedProcess(
+        list(command), process.returncode, stdout=stdout, stderr=stderr
+    )
+
+
 # ============================================================================
 # 视频合并函数
 # ============================================================================
@@ -1119,9 +1314,9 @@ def merge_videos(files: Sequence[str], output_file: str) -> bool:
                     ) as remux_file:
                         remux_path = remux_file.name
                     temp_remux_files.append(remux_path)
-                    subprocess.run(
+                    _run_ffmpeg_background(
                         [get_ffmpeg_path(), "-i", file_path, "-c", "copy", "-y", remux_path],
-                        check=True, capture_output=True, encoding="utf-8", errors="replace", timeout=600,
+                        600,
                     )
                     if not verify_file_integrity(remux_path):
                         raise Exception(f"视频转封装验证失败: {file_path}")
@@ -1161,14 +1356,7 @@ def merge_videos(files: Sequence[str], output_file: str) -> bool:
 
         # 执行 FFmpeg 合并
         try:
-            result = subprocess.run(
-                ffmpeg_cmd,
-                check=True,
-                capture_output=True,
-                encoding="utf-8",
-                errors="replace",
-                timeout=600,  # 10 分钟超时
-            )
+            result = _run_ffmpeg_background(ffmpeg_cmd, 600)
 
             logger.debug(f"FFmpeg 输出: {result.stderr}")
 
@@ -1214,6 +1402,169 @@ def merge_videos(files: Sequence[str], output_file: str) -> bool:
                     logger.warning(f"清理临时文件失败: {temp_file}, 错误: {e}")
 
 
+def combine_video_views(
+    ppt_file: str,
+    teacher_file: str,
+    output_file: str,
+    *,
+    ppt_offset: float = 0.0,
+) -> bool:
+    """Render the PPT and teacher views into one side-by-side MP4 file."""
+
+    if not isinstance(ppt_file, str) or not isinstance(teacher_file, str) or not isinstance(output_file, str):
+        raise ValueError("视频路径必须是字符串")
+    if not Path(ppt_file).is_file() or not Path(teacher_file).is_file():
+        raise FileNotFoundError("双视角视频文件不存在")
+    if not check_ffmpeg_availability():
+        logger.error("无法导出双视角视频：未找到 FFmpeg")
+        return False
+
+    output_path = Path(output_file)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    if output_path.exists() and verify_file_integrity(str(output_path)):
+        logger.info(f"双视角视频已存在，跳过导出: {output_path.name}")
+        return True
+
+    try:
+        offset = max(-3600.0, min(3600.0, float(ppt_offset)))
+    except (TypeError, ValueError):
+        offset = 0.0
+
+    # Positive offset holds the first PPT frame; negative offset trims its leading part.
+    ppt_timing = "setpts=PTS-STARTPTS"
+    if offset > 0:
+        ppt_timing += f",tpad=start_mode=clone:start_duration={offset:.3f}"
+    elif offset < 0:
+        ppt_timing = f"trim=start={-offset:.3f},setpts=PTS-STARTPTS"
+
+    temp_output = output_path.with_name(f".{output_path.name}.tmp.mp4")
+    filter_graph = (
+        "[0:v]setpts=PTS-STARTPTS,fps=25,scale=-2:480,setsar=1[teacher];"
+        f"[1:v]{ppt_timing},fps=25,scale=-2:480,setsar=1[ppt];"
+        "[teacher][ppt]hstack=inputs=2:shortest=1[v]"
+    )
+    cpu_count = os.cpu_count() or 4
+    decode_threads = max(2, min(4, cpu_count // 6))
+    encoder_threads = max(4, min(8, cpu_count // 3))
+    encoder = _preferred_video_encoder()
+    encoders = [encoder]
+    if encoder != "libx264":
+        encoders.append("libx264")
+
+    last_error = ""
+    for selected_encoder in encoders:
+        command = [
+            get_ffmpeg_path(),
+            "-hide_banner",
+            "-filter_threads", str(decode_threads),
+            "-filter_complex_threads", str(decode_threads),
+            "-threads", str(decode_threads), "-i", teacher_file,
+            "-threads", str(decode_threads), "-i", ppt_file,
+            "-filter_complex", filter_graph,
+            "-map", "[v]",
+            "-map", "0:a?",
+        ]
+        if selected_encoder == "h264_nvenc":
+            command.extend(
+                [
+                    "-c:v", "h264_nvenc",
+                    "-preset", "p5",
+                    "-tune", "hq",
+                    "-rc", "vbr",
+                    "-cq", "28",
+                    "-b:v", "0",
+                    "-maxrate", "2M",
+                    "-bufsize", "4M",
+                    "-spatial-aq", "1",
+                    "-temporal-aq", "1",
+                ]
+            )
+        else:
+            command.extend(
+                [
+                    "-c:v", selected_encoder,
+                    "-preset", "medium",
+                    "-crf", "21",
+                    "-threads:v", str(encoder_threads),
+                ]
+            )
+        command.extend(
+            [
+                "-pix_fmt", "yuv420p",
+                "-c:a", "aac",
+                "-b:a", "128k",
+                "-shortest",
+                "-movflags", "+faststart",
+                "-y", str(temp_output),
+            ]
+        )
+
+        temp_output.unlink(missing_ok=True)
+        try:
+            logger.info(
+                f"开始导出双视角视频: {output_path.name}, "
+                f"编码器={selected_encoder}, 解码线程={decode_threads}, "
+                f"编码线程={encoder_threads if selected_encoder == 'libx264' else 'GPU'}"
+            )
+            _run_ffmpeg_background(command, 3600)
+            if not verify_file_integrity(str(temp_output)):
+                raise RuntimeError("导出文件完整性校验失败")
+            shutil.move(str(temp_output), str(output_path))
+            logger.info(
+                f"双视角视频导出完成: {output_path.name}, 编码器={selected_encoder}"
+            )
+            return True
+        except subprocess.TimeoutExpired:
+            last_error = "导出超时"
+            logger.error(f"双视角视频导出超时，编码器={selected_encoder}")
+        except subprocess.CalledProcessError as exc:
+            last_error = (exc.stderr or str(exc)).strip()
+            logger.error(
+                f"FFmpeg 导出双视角视频失败，编码器={selected_encoder}: {last_error}"
+            )
+        except Exception as exc:
+            last_error = str(exc)
+            logger.error(
+                f"导出双视角视频失败，编码器={selected_encoder}: {last_error}"
+            )
+        finally:
+            temp_output.unlink(missing_ok=True)
+
+    logger.error(f"双视角视频导出最终失败: {output_path.name}, {last_error}")
+    return False
+
+
+def _combine_view_pairs(save_dir: str) -> int:
+    """Combine matching view files and remove sources after successful export."""
+
+    directory = Path(save_dir)
+    combined_count = 0
+    for ppt_file in sorted((*directory.glob("*-pptVideo.mp4"), *directory.glob("*-pptVideo.ts"))):
+        prefix = ppt_file.name.rsplit("-pptVideo", 1)[0]
+        teacher_file = next(
+            (
+                candidate
+                for candidate in (
+                    directory / f"{prefix}-teacherTrack.mp4",
+                    directory / f"{prefix}-teacherTrack.ts",
+                )
+                if candidate.is_file()
+            ),
+            None,
+        )
+        if teacher_file is None:
+            continue
+        output_file = directory / f"{prefix}-combined.mp4"
+        if combine_video_views(str(ppt_file), str(teacher_file), str(output_file)):
+            for source in (ppt_file, teacher_file):
+                try:
+                    source.unlink()
+                except OSError as exc:
+                    logger.warning(f"删除合并源文件失败: {source}: {exc}")
+            combined_count += 1
+    return combined_count
+
+
 def process_rows(
     rows: List[List[Any]],
     course_code: str,
@@ -1255,8 +1606,8 @@ def process_rows(
     if not course_name or not isinstance(course_name, str):
         raise ValueError("课程名称不能为空且必须是字符串类型")
 
-    if video_type not in ["both", "ppt", "teacher"]:
-        raise ValueError("视频类型必须是 'both', 'ppt' 或 'teacher'")
+    if video_type not in ["both", "ppt", "teacher", "combined"]:
+        raise ValueError("视频类型必须是 'both', 'ppt', 'teacher' 或 'combined'")
 
     # 保持简洁：已移除自定义下载命令参数
 
@@ -1273,6 +1624,7 @@ def process_rows(
         "skipped": 0,
         "failed": 0,
         "merged": 0,
+        "combined": 0,
         "subtitles": 0,
         "subtitle_merged": 0,
     }
@@ -1541,9 +1893,9 @@ def process_rows(
 
     # 处理所有视频
     total_tasks = 0
-    if video_type in ["both", "ppt"]:
+    if video_type in ["both", "ppt", "combined"]:
         total_tasks += len(rows)
-    if video_type in ["both", "teacher"]:
+    if video_type in ["both", "teacher", "combined"]:
         total_tasks += len(rows)
 
     stats["total_videos"] = total_tasks
@@ -1558,8 +1910,23 @@ def process_rows(
                 if subtitle_downloaded:
                     stats["subtitles"] += 1
 
+                if video_type == "combined":
+                    components = get_safe_filename_components(row)
+                    if components:
+                        month, date, day, jie, days, day_chinese = components
+                        combined_name = (
+                            f"{course_code}{course_name}{year}年{month}月{date}日第{days}周"
+                            f"星期{day_chinese}第{jie}节-combined.mp4"
+                        )
+                        combined_path = Path(save_dir) / combined_name
+                        if combined_path.exists() and verify_file_integrity(str(combined_path)):
+                            logger.info(f"双视角合并视频已存在，跳过: {combined_name}")
+                            stats["skipped"] += 1
+                            pbar.update(2)
+                            continue
+
                 # 处理PPT视频
-                if video_type in ["both", "ppt"]:
+                if video_type in ["both", "ppt", "combined"]:
                     result = process_single_video(row[5], "pptVideo", row)
                     if result["downloaded"]:
                         stats["downloaded"] += 1
@@ -1572,7 +1939,7 @@ def process_rows(
                     pbar.update(1)
 
                 # 处理教师视频
-                if video_type in ["both", "teacher"]:
+                if video_type in ["both", "teacher", "combined"]:
                     result = process_single_video(row[6], "teacherTrack", row)
                     if result["downloaded"]:
                         stats["downloaded"] += 1
@@ -1589,6 +1956,11 @@ def process_rows(
                 stats["failed"] += 1
                 pbar.update(1)
 
+    if video_type == "combined":
+        stats["combined"] = _combine_view_pairs(save_dir)
+        if stats["combined"] == 0 and rows:
+            stats["failed"] += 1
+
     # 输出处理结果
     logger.info("视频处理完成！")
     logger.info(f"统计信息: 总计 {stats['total_videos']} 个视频")
@@ -1596,6 +1968,7 @@ def process_rows(
     logger.info(f"  - 跳过: {stats['skipped']} 个")
     logger.info(f"  - 失败: {stats['failed']} 个")
     logger.info(f"  - 合并: {stats['merged']} 个")
+    logger.info(f"  - 双视角合并: {stats['combined']} 个")
     logger.info(f"  - 字幕: {stats['subtitles']} 个")
     logger.info(f"  - 字幕合并: {stats['subtitle_merged']} 个")
 
@@ -1631,6 +2004,12 @@ def download_single_video(
     try:
         month, date, day, jie, days, ppt_video, teacher_track = row[:7]
         day_chinese = day_to_chinese(day)
+        prefix = f"{course_code}{course_name}{year}年{month}月{date}日第{days}周星期{day_chinese}第{jie}节"
+        combined_output = Path(save_dir) / f"{prefix}-combined.mp4"
+
+        if video_type == "combined" and combined_output.exists() and verify_file_integrity(str(combined_output)):
+            print(f"双视角合并视频已存在，跳过：{combined_output.name}")
+            return True
 
         success_count = 0
         total_count = 0
@@ -1642,7 +2021,7 @@ def download_single_video(
             print(f"字幕下载成功：{subtitle_path.name}")
 
         # 下载PPT视频
-        if video_type in ["both", "ppt"] and ppt_video:
+        if video_type in ["both", "ppt", "combined"] and ppt_video:
             total_count += 1
             filename = (
                 f"{course_code}{course_name}{year}年{month}月{date}日第{days}周星期{day_chinese}第{jie}节-pptVideo.mp4"
@@ -1661,7 +2040,7 @@ def download_single_video(
                     print(f"PPT 视频下载失败：{filename}")
 
         # 下载教师视频
-        if video_type in ["both", "teacher"] and teacher_track:
+        if video_type in ["both", "teacher", "combined"] and teacher_track:
             total_count += 1
             filename = f"{course_code}{course_name}{year}年{month}月{date}日第{days}周星期{day_chinese}第{jie}节-teacherTrack.mp4"
             filepath = Path(save_dir) / filename
@@ -1676,6 +2055,16 @@ def download_single_video(
                     print(f"教师视频下载成功：{filename}")
                 else:
                     print(f"教师视频下载失败：{filename}")
+
+        if video_type == "combined" and success_count == total_count == 2:
+            ppt_file = Path(save_dir) / f"{prefix}-pptVideo.mp4"
+            teacher_file = Path(save_dir) / f"{prefix}-teacherTrack.mp4"
+            if combine_video_views(str(ppt_file), str(teacher_file), str(combined_output)):
+                ppt_file.unlink(missing_ok=True)
+                teacher_file.unlink(missing_ok=True)
+                print(f"双视角合并视频导出成功：{combined_output.name}")
+                return True
+            return False
 
         print(f"\n半节课下载完成：成功 {success_count}/{total_count} 个视频")
         return success_count == total_count
@@ -1697,6 +2086,9 @@ def download_course_videos(
     merge: bool = True,
     video_type: str = "both",
     skip_weeks: Optional[Set[int]] = None,
+    include_weeks: Optional[Set[int]] = None,
+    dates: Optional[Set[Tuple[int, int]]] = None,
+    lesson_numbers: Optional[Set[int]] = None,
     auth_cookies: Optional[Mapping[str, str]] = None,
 ) -> bool:
     """
@@ -1714,6 +2106,12 @@ def download_course_videos(
     """
     if skip_weeks is None:
         skip_weeks = set()
+    if include_weeks is None:
+        include_weeks = set()
+    if dates is None:
+        dates = set()
+    if lesson_numbers is None:
+        lesson_numbers = set()
     try:
         logger.info(f"开始下载课程 {live_id} 的视频")
 
@@ -1803,9 +2201,33 @@ def download_course_videos(
 
         # 只处理已结束的课程
         valid_entries = [entry for entry in data if entry.get("endTime", {}).get("time", 0) / 1000 <= time.time()]
+        if include_weeks:
+            valid_entries = [
+                entry for entry in valid_entries if int(entry.get("days", 0)) in include_weeks
+            ]
+        if dates:
+            valid_entries = [
+                entry
+                for entry in valid_entries
+                if (
+                    int(entry.get("startTime", {}).get("month", 0)),
+                    int(entry.get("startTime", {}).get("date", 0)),
+                )
+                in dates
+            ]
+        if lesson_numbers:
+            valid_entries = [
+                entry
+                for entry in valid_entries
+                if parse_lesson_ranges(str(entry.get("jie", ""))) & lesson_numbers
+            ]
+        if skip_weeks:
+            valid_entries = [
+                entry for entry in valid_entries if int(entry.get("days", 0)) not in skip_weeks
+            ]
 
         if not valid_entries:
-            print("没有找到已结束的课程，无法下载")
+            print("没有符合当前周次、日期、节次条件的已结束课程")
             return False
 
         clear_overwrite_line()
@@ -1851,6 +2273,38 @@ def download_course_videos(
         # 按时间排序：月、日、星期、节次、周数
         rows.sort(key=lambda x: (x[0], x[1], x[2], int(x[3]), x[4]))
 
+        # Apply the shared week/date/lesson selectors in one place.
+        if include_weeks:
+            original_count = len(rows)
+            rows = [row for row in rows if int(row[4]) in include_weeks]
+            print(
+                f"根据设置只保留第 {', '.join(map(str, sorted(include_weeks)))} 周，"
+                f"筛选后剩 {len(rows)}/{original_count} 个视频"
+            )
+
+        if dates:
+            original_count = len(rows)
+            rows = [
+                row
+                for row in rows
+                if (int(row[0]), int(row[1])) in dates
+            ]
+            date_text = ", ".join(f"{month}月{day}日" for month, day in sorted(dates))
+            print(f"根据日期筛选 {date_text}，筛选后剩 {len(rows)}/{original_count} 个视频")
+
+        if lesson_numbers:
+            original_count = len(rows)
+            filtered_rows = []
+            for row in rows:
+                row_lessons = parse_lesson_ranges(str(row[3]))
+                if row_lessons & lesson_numbers:
+                    filtered_rows.append(row)
+            rows = filtered_rows
+            print(
+                f"根据节次筛选 {', '.join(map(str, sorted(lesson_numbers)))}，"
+                f"筛选后剩 {len(rows)}/{original_count} 个视频"
+            )
+
         # 根据 skip_weeks 参数过滤掉指定周数的视频
         if skip_weeks:
             original_count = len(rows)
@@ -1862,6 +2316,10 @@ def download_course_videos(
                     print(f"根据设置跳过了第 {', '.join(map(str, skip_list))} 周的 {filtered_count} 个视频")
                 else:
                     print(f"根据设置跳过了 {len(skip_list)} 个周的 {filtered_count} 个视频")
+
+        if not rows:
+            print("当前周次、日期和节次筛选条件下没有可下载的视频")
+            return False
 
         # 保存视频信息到 CSV 文件（保存到 logs/ 目录以便集中管理日志/元数据）
         try:
@@ -1964,6 +2422,10 @@ def process_all_courses(
     config: configparser.ConfigParser,
     video_type: str = "both",
     auth_cookies: Optional[Mapping[str, str]] = None,
+    include_weeks: Optional[Set[int]] = None,
+    dates: Optional[Set[Tuple[int, int]]] = None,
+    lesson_numbers: Optional[Set[int]] = None,
+    course_filters: Optional[Mapping[str, Mapping[str, Any]]] = None,
 ) -> bool:
     """
     处理配置文件中的所有课程。
@@ -1998,11 +2460,24 @@ def process_all_courses(
         try:
             # 下载课程视频 - 使用提取的核心下载函数
             clear_overwrite_line()
+            has_specific_filter = bool(course_filters and section_name in course_filters)
+            section_filter = course_filters[section_name] if has_specific_filter else {}
             success = download_course_videos(
                 live_id,
                 single=0,
                 merge=True,
                 video_type=video_type,
+                include_weeks=(
+                    section_filter.get("include_weeks")
+                    if has_specific_filter
+                    else include_weeks
+                ),
+                dates=section_filter.get("dates") if has_specific_filter else dates,
+                lesson_numbers=(
+                    section_filter.get("lesson_numbers")
+                    if has_specific_filter
+                    else lesson_numbers
+                ),
                 auth_cookies=auth_cookies,
             )
             if success:

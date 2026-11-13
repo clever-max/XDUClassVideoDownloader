@@ -1,6 +1,6 @@
 """Compatibility facade for the XDUClassVideoDownloader 5.x downloader."""
 
-from typing import Any, Dict, List, Mapping, Optional, Sequence, Set, Union
+from typing import Any, Dict, List, Mapping, Optional, Sequence, Set, Tuple, Union
 from pathlib import Path
 
 from xduclassvideodownloader.core import auth as _auth
@@ -95,6 +95,9 @@ def download_course_videos(
     merge: bool = True,
     video_type: str = "both",
     skip_weeks: Optional[Set[int]] = None,
+    include_weeks: Optional[Set[int]] = None,
+    dates: Optional[Set[Tuple[int, int]]] = None,
+    lesson_numbers: Optional[Set[int]] = None,
 ) -> bool:
     return _core_downloader.download_course_videos(
         live_id,
@@ -102,11 +105,33 @@ def download_course_videos(
         merge,
         video_type,
         skip_weeks,
+        include_weeks=include_weeks,
+        dates=dates,
+        lesson_numbers=lesson_numbers,
         auth_cookies=_auth.get_auth_cookies(),
     )
 
 
-def process_all_courses(config, video_type: str = "both") -> bool:
+def process_all_courses(
+    config,
+    video_type: str = "both",
+    include_weeks: Optional[Set[int]] = None,
+    dates: Optional[Set[Tuple[int, int]]] = None,
+    lesson_numbers: Optional[Set[int]] = None,
+    course_filters: Optional[Mapping[str, Mapping[str, Any]]] = None,
+) -> bool:
+    filters = {}
+    if include_weeks:
+        filters["include_weeks"] = include_weeks
+    if dates:
+        filters["dates"] = dates
+    if lesson_numbers:
+        filters["lesson_numbers"] = lesson_numbers
+    if course_filters:
+        filters["course_filters"] = course_filters
     return _core_downloader.process_all_courses(
-        config, video_type, _auth.get_auth_cookies()
+        config,
+        video_type,
+        _auth.get_auth_cookies(),
+        **filters,
     )

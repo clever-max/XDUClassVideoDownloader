@@ -135,8 +135,8 @@ def validate_download_parameters(
         raise ValueError("下载模式必须是 0（全部）、1（单节课）或 2（半节课）")
 
     # 验证 video_type
-    if video_type not in ["both", "ppt", "teacher"]:
-        raise ValueError('视频类型必须是 "both"、"ppt" 或 "teacher"')
+    if video_type not in ["both", "ppt", "teacher", "combined"]:
+        raise ValueError('视频类型必须是 "both"、"ppt"、"teacher" 或 "combined"')
 
     return validated_liveid, single, video_type
 
