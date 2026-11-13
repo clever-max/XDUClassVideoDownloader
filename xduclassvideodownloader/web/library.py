@@ -6,7 +6,7 @@ from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 
 VIDEO_RE = re.compile(
-    r"^(?P<prefix>.+?)(?P<year>\d{4})年(?P<month>\d{1,2})月(?P<date>\d{1,2})日第(?P<week>[^周]+)周星期(?P<day>.+?)第(?P<jie>\d+(?:-\d+)?)节-(?P<track>pptVideo|teacherTrack)\.(?P<ext>mp4|ts)$"
+    r"^(?P<prefix>.+?)(?P<year>\d{4})年(?P<month>\d{1,2})月(?P<date>\d{1,2})日第(?P<week>[^周]+)周星期(?P<day>.+?)第(?P<jie>\d+(?:-\d+)?)节-(?P<track>pptVideo|teacherTrack|combined)\.(?P<ext>mp4|ts)$"
 )
 SUBTITLE_RE = re.compile(
     r"^(?P<prefix>.+?)(?P<year>\d{4})年(?P<month>\d{1,2})月(?P<date>\d{1,2})日第(?P<week>[^周]+)周星期(?P<day>.+?)第(?P<jie>\d+(?:-\d+)?)节\.(?P<ext>srt|vtt)$"

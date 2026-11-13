@@ -82,13 +82,30 @@
               <label>
                 视频类型
                 <select id="singleVideoType">
-                  <option value="both">两种都下载</option>
+                  <option value="both">两种都下载（分开保存）</option>
                   <option value="ppt">仅 pptVideo</option>
                   <option value="teacher">仅 teacherTrack</option>
+                  <option value="combined">仅合并视频</option>
                 </select>
               </label>
+              <div class="filter-span">
+                <div class="filter-heading">
+                  <span>下载周次</span>
+                  <span id="singleWeekSummary" class="muted-text">全部周次</span>
+                </div>
+                <div id="singleWeekPicker" class="week-picker" aria-label="选择下载周次"></div>
+                <input id="singleWeeks" type="hidden" value="">
+              </div>
               <label>
-                跳过周数（可选）
+                日期（可选）
+                <input id="singleDates" type="text" placeholder="如 9-11,10-16">
+              </label>
+              <label>
+                节次（可选）
+                <input id="singleLessons" type="text" placeholder="如 5-6,9">
+              </label>
+              <label>
+                排除周次（可选）
                 <input id="singleSkipWeeks" type="text" placeholder="如 1-3,7,9-11">
               </label>
               <label class="check-row">
@@ -128,9 +145,10 @@
                 <label>
                   视频类型
                   <select id="batchInitVideoType">
-                    <option value="both">两种都下载</option>
+                    <option value="both">两种都下载（分开保存）</option>
                     <option value="ppt">仅 pptVideo</option>
                     <option value="teacher">仅 teacherTrack</option>
+                    <option value="combined">仅合并视频</option>
                   </select>
                 </label>
               </div>
@@ -145,9 +163,10 @@
                 <label>
                   下载视频类型
                   <select id="batchVideoType">
-                    <option value="both">两种都下载</option>
+                    <option value="both">两种都下载（分开保存）</option>
                     <option value="ppt">仅 pptVideo</option>
                     <option value="teacher">仅 teacherTrack</option>
+                    <option value="combined">仅合并视频</option>
                   </select>
                 </label>
                 <div class="inline-actions">
@@ -188,6 +207,7 @@
           <section class="panel player-panel">
             <div class="panel-header">
               <h2 id="viewerTitle">请选择一节课</h2>
+              <button id="combineViews" class="secondary-btn" type="button" disabled>导出双视角</button>
               <button id="maximizePlayer" class="icon-btn" type="button" title="最大化视频块" aria-label="最大化视频块">
                 <svg class="expand-icon" viewBox="0 0 24 24"><path d="M8 3H3v5M16 3h5v5M8 21H3v-5M21 16v5h-5"/></svg>
                 <svg class="collapse-icon" viewBox="0 0 24 24"><path d="M4 9h5V4M20 9h-5V4M9 20v-5H4M15 20v-5h5"/></svg>

@@ -17,6 +17,7 @@ import webbrowser
 from argparse import ArgumentParser, Namespace
 from pathlib import Path
 from typing import Any, Dict, Iterable, Optional, Tuple
+from urllib.parse import unquote, urlparse
 
 from flask import Flask, Response, jsonify, request, send_file, send_from_directory, session
 from flask.typing import ResponseReturnValue
@@ -36,6 +37,8 @@ from ..core.platform import (
     get_last_update_info,
 )
 from ..core.utils import (
+    parse_date_ranges,
+    parse_lesson_ranges,
     parse_week_ranges,
     pause_before_exit_if_frozen,
     setup_logging,
@@ -56,7 +59,14 @@ from .auth import (
     auth_config_payload as _auth_config_payload,
     save_auth_payload as _save_auth_payload,
 )
-from .downloads import DOWNLOAD_ACTIVE_STATUSES, DownloadJob, jobs, run_batch_download, run_single_download
+from .downloads import (
+    DOWNLOAD_ACTIVE_STATUSES,
+    DownloadJob,
+    jobs,
+    run_batch_download,
+    run_combined_export,
+    run_single_download,
+)
 from .library import index_local_library
 from .settings import (
     automation_config_payload as _automation_config_payload,
@@ -72,7 +82,7 @@ logger = setup_logging("webui")
 APP_DIR = get_app_path()
 STATIC_DIR = get_bundled_app_path("web", "static")
 ALLOWED_MEDIA_SUFFIXES = {".mp4", ".ts", ".srt", ".vtt"}
-VIDEO_TYPE_CHOICES = {"both", "ppt", "teacher"}
+VIDEO_TYPE_CHOICES = {"both", "ppt", "teacher", "combined"}
 QR_CANCELLABLE_STATUSES = {"pending", "waiting"}
 DEFAULT_WEBUI_PORT = 5050
 PORT_SCAN_LIMIT = 100
@@ -241,6 +251,10 @@ def _download_stream_url(job_id: str) -> str:
     return f"/api/download/jobs/{job_id}/stream"
 
 
+def _download_job_payload(job: DownloadJob) -> Dict[str, Any]:
+    return {**job.snapshot(), "job_id": job.id, "stream_url": _download_stream_url(job.id)}
+
+
 def _qr_image_url(job_id: str) -> str:
     return f"/api/settings/qr/{job_id}/image"
 
@@ -251,10 +265,18 @@ def _start_single_download_from_payload(payload: Dict[str, Any]) -> DownloadJob:
     video_type = str(payload.get("video_type", "both"))
     validate_download_parameters(live_id, single, video_type)
     skip_weeks = str(payload.get("skip_weeks", "")).strip()
-    if skip_weeks:
-        parse_week_ranges(skip_weeks)
+    weeks = str(payload.get("weeks", "")).strip()
+    dates = str(payload.get("dates", "")).strip()
+    lessons = str(payload.get("lessons", "")).strip()
+    parse_week_ranges(skip_weeks)
+    parse_week_ranges(weeks)
+    parse_date_ranges(dates)
+    parse_lesson_ranges(lessons)
     merge = bool(payload.get("merge", True))
-    return jobs.start(_run_single_download, (live_id, single, merge, video_type, skip_weeks))
+    return jobs.start(
+        _run_single_download,
+        (live_id, single, merge, video_type, skip_weeks, weeks, dates, lessons),
+    )
 
 
 def _start_batch_download_from_payload(payload: Dict[str, Any]) -> DownloadJob:
@@ -264,7 +286,73 @@ def _start_batch_download_from_payload(payload: Dict[str, Any]) -> DownloadJob:
     video_type = str(payload.get("video_type", "both"))
     if video_type not in VIDEO_TYPE_CHOICES:
         raise ValueError("视频类型无效")
-    return jobs.start(_run_batch_download, (selected_sections, video_type))
+    weeks = str(payload.get("weeks", "")).strip()
+    dates = str(payload.get("dates", "")).strip()
+    lessons = str(payload.get("lessons", "")).strip()
+    parse_week_ranges(weeks)
+    parse_date_ranges(dates)
+    parse_lesson_ranges(lessons)
+    raw_course_filters = payload.get("course_filters") or {}
+    if not isinstance(raw_course_filters, dict):
+        raise ValueError("课程筛选配置格式无效")
+    course_filters = {}
+    for section in selected_sections:
+        raw_filter = raw_course_filters.get(str(section), {})
+        if not isinstance(raw_filter, dict):
+            raise ValueError(f"课程 {section} 的筛选配置格式无效")
+        section_weeks = str(raw_filter.get("weeks", "")).strip()
+        section_dates = str(raw_filter.get("dates", "")).strip()
+        section_lessons = str(raw_filter.get("lessons", "")).strip()
+        parse_week_ranges(section_weeks)
+        parse_date_ranges(section_dates)
+        parse_lesson_ranges(section_lessons)
+        if section_weeks or section_dates or section_lessons:
+            course_filters[str(section)] = {
+                "weeks": section_weeks,
+                "dates": section_dates,
+                "lessons": section_lessons,
+            }
+    return jobs.start(
+        _run_batch_download,
+        (selected_sections, video_type, weeks, dates, lessons, course_filters),
+    )
+
+
+def _resolve_media_file(value: Any) -> Path:
+    raw = str(value or "")
+    parsed = urlparse(raw)
+    if parsed.path.startswith("/media/"):
+        relative = unquote(parsed.path[len("/media/"):])
+    else:
+        raise ValueError("媒体路径无效")
+    requested = (APP_DIR / relative).resolve()
+    try:
+        requested.relative_to(APP_DIR.resolve())
+    except ValueError as exc:
+        raise ValueError("媒体路径无效") from exc
+    if requested.suffix.lower() not in {".mp4", ".ts"} or not requested.is_file():
+        raise ValueError("媒体文件不存在或类型不允许")
+    return requested
+
+
+def _start_combined_export_from_payload(payload: Dict[str, Any]) -> DownloadJob:
+    ppt_file = _resolve_media_file(payload.get("ppt_url"))
+    teacher_file = _resolve_media_file(payload.get("teacher_url"))
+    if ppt_file.parent != teacher_file.parent:
+        raise ValueError("两个视角必须来自同一课程目录")
+    if not ppt_file.name.endswith(("-pptVideo.mp4", "-pptVideo.ts")):
+        raise ValueError("PPT 视频文件无效")
+    if not teacher_file.name.endswith(("-teacherTrack.mp4", "-teacherTrack.ts")):
+        raise ValueError("教师视频文件无效")
+    output_name = ppt_file.name.rsplit("-pptVideo", 1)[0] + "-combined.mp4"
+    try:
+        ppt_offset = max(-3600.0, min(3600.0, float(payload.get("ppt_offset", 0))))
+    except (TypeError, ValueError):
+        ppt_offset = 0.0
+    return jobs.start(
+        run_combined_export,
+        (str(ppt_file), str(teacher_file), str(ppt_file.parent / output_name), ppt_offset),
+    )
 
 
 def _webui_password_enabled() -> bool:
@@ -469,7 +557,7 @@ def start_download() -> ResponseReturnValue:
             job = _start_batch_download_from_payload(payload)
         else:
             raise ValueError("下载模式无效")
-        return _json_ok(job_id=job.id, stream_url=_download_stream_url(job.id))
+        return _json_ok(**_download_job_payload(job))
     except Exception as exc:
         return _json_error(str(exc), 400)
 
@@ -480,27 +568,63 @@ def stream_download_job(job_id: str) -> ResponseReturnValue:
     if not job:
         return _json_error("任务不存在", 404)
 
+    try:
+        after = int(request.args.get("after", "-1"))
+    except ValueError:
+        after = -1
+
     def generate() -> Iterable[str]:
-        yield "event: status\ndata: " + json.dumps({"status": job.status}, ensure_ascii=False) + "\n\n"
-        index = 0
+        cursor = after
+        last_version = -1
         while True:
             with job.condition:
-                if index >= len(job.history) and job.status in DOWNLOAD_ACTIVE_STATUSES:
+                current_version = job.state_version
+                current_start = job.history_start
+                current_end = current_start + len(job.history) - 1
+                if (
+                    current_version == last_version
+                    and cursor >= current_end
+                    and job.status in DOWNLOAD_ACTIVE_STATUSES
+                ):
                     job.condition.wait(timeout=1)
-                items = job.history[index:]
-                index = len(job.history)
+                status = job.status
+                state_version = job.state_version
+                status_payload = {
+                    **job.snapshot(),
+                }
+                start_index = max(0, cursor - job.history_start + 1)
+                items = list(enumerate(job.history[start_index:], start=job.history_start + start_index))
+                if items:
+                    cursor = items[-1][0]
                 done = job.status not in DOWNLOAD_ACTIVE_STATUSES
 
-            for item in items:
-                yield "data: " + json.dumps({"text": item}, ensure_ascii=False) + "\n\n"
+            if state_version != last_version:
+                yield "event: status\ndata: " + json.dumps(status_payload, ensure_ascii=False) + "\n\n"
+                last_version = state_version
+
+            for item_cursor, item in items:
+                yield "data: " + json.dumps({"text": item, "cursor": item_cursor}, ensure_ascii=False) + "\n\n"
 
             if done:
                 yield "event: done\ndata: " + json.dumps(
-                    {"status": job.status, "success": job.success, "error": job.error}, ensure_ascii=False
+                    {"status": status, "success": job.success, "error": job.error, "cursor": cursor},
+                    ensure_ascii=False,
                 ) + "\n\n"
                 break
 
-    return Response(generate(), mimetype="text/event-stream")
+    return Response(
+        generate(),
+        mimetype="text/event-stream",
+        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+    )
+
+
+@app.route("/api/download/jobs/<job_id>", methods=["GET"])
+def download_job_status(job_id: str) -> ResponseReturnValue:
+    job = jobs.get(job_id)
+    if not job:
+        return _json_error("任务不存在", 404)
+    return _json_ok(**_download_job_payload(job))
 
 
 @app.route("/api/download/active", methods=["GET"])
@@ -508,12 +632,17 @@ def active_download_job() -> ResponseReturnValue:
     job = jobs.active()
     if not job:
         return _json_ok(active=False)
-    return _json_ok(
-        active=True,
-        job_id=job.id,
-        status=job.status,
-        stream_url=_download_stream_url(job.id),
-    )
+    return _json_ok(active=True, **_download_job_payload(job))
+
+
+@app.route("/api/library/combine", methods=["POST"])
+def combine_library_videos() -> ResponseReturnValue:
+    try:
+        payload = _request_json(require_body=True)
+        job = _start_combined_export_from_payload(payload)
+        return _json_ok(**_download_job_payload(job))
+    except Exception as exc:
+        return _json_error(str(exc), 400)
 
 
 @app.route("/api/library", methods=["GET"])

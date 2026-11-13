@@ -1,6 +1,7 @@
 const state = {
   appMessage: "欢迎使用！如有问题请联系作者。",
   automationCourses: [],
+  batchCourseFilters: {},
   subtitles: [],
   activeVideos: [],
   subtitleDriver: null,
@@ -18,6 +19,10 @@ const state = {
   progressDragging: false,
   suppressMediaEventsUntil: 0,
   outputSource: null,
+  outputReconnectTimer: null,
+  downloadJobId: null,
+  outputCursor: -1,
+  taskCompletionShown: false,
   terminalLines: [""],
   terminalRow: 0,
   terminalCol: 0,
@@ -55,6 +60,35 @@ function setStatus(text, kind = "") {
   const el = $("globalStatus");
   el.textContent = text;
   el.dataset.kind = kind;
+}
+
+function downloadStatusLabel(status) {
+  return {
+    pending: "排队中",
+    running: "运行中",
+    success: "完成",
+    failed: "失败",
+  }[status] || status || "未知状态";
+}
+
+function applyDownloadSnapshot(snapshot) {
+  if (!snapshot) return;
+  if (snapshot.id) state.downloadJobId = snapshot.id;
+  const status = snapshot.status;
+  if (!status) return;
+  const terminal = status === "success" || status === "failed";
+  setStatus(downloadStatusLabel(status), terminal ? (status === "success" ? "success" : "error") : "running");
+  if (terminal) state.taskCompletionShown = true;
+}
+
+function rememberDownloadJob(jobId) {
+  state.downloadJobId = jobId || null;
+  if (!state.downloadJobId) return;
+  try {
+    localStorage.setItem("xduclassvideodownloader.downloadJobId", state.downloadJobId);
+  } catch (_err) {
+    // Local storage can be disabled without affecting downloads.
+  }
 }
 
 function appendOutput(text) {
@@ -197,7 +231,9 @@ async function apiJson(url, options = {}) {
   });
   const data = await res.json();
   if (!res.ok || data.ok === false) {
-    throw new Error(data.error || `请求失败: ${res.status}`);
+    const error = new Error(data.error || `请求失败: ${res.status}`);
+    error.status = res.status;
+    throw error;
   }
   return data;
 }
@@ -315,18 +351,122 @@ function renderAutomation(data) {
   const list = $("courseList");
   list.innerHTML = "";
   for (const course of state.automationCourses) {
-    const row = document.createElement("label");
+    const section = String(course.section);
+    const item = document.createElement("div");
+    item.className = "course-filter-item";
+    const row = document.createElement("div");
     row.className = "course-row";
     row.innerHTML = `
-      <input type="checkbox" data-section="${course.section}" ${course.selected ? "checked" : ""}>
+      <input type="checkbox" data-section="${escapeHtml(section)}" ${course.selected ? "checked" : ""}>
       <span>
         <span class="course-name">${escapeHtml(course.course_name || "未命名课程")}</span>
         <span class="course-meta">${escapeHtml(course.course_code || "")} · LiveID ${escapeHtml(course.live_id || "")}</span>
       </span>
-      <span class="course-meta">${course.download === "yes" ? "配置: 下载" : "配置: 不下载"}</span>
+      <button class="ghost-btn course-filter-toggle" type="button">全部</button>
     `;
-    list.appendChild(row);
+    const existing = state.batchCourseFilters[section] || {};
+    const filterState = {
+      weeks: new Set(existing.weeks || []),
+      dates: existing.dates || "",
+      lessons: existing.lessons || "",
+      expanded: Boolean(existing.expanded),
+    };
+    state.batchCourseFilters[section] = filterState;
+    const toggle = row.querySelector(".course-filter-toggle");
+    const panel = document.createElement("div");
+    panel.className = "course-filter-panel";
+    panel.innerHTML = `
+      <div class="filter-heading">
+        <span>课程筛选</span>
+        <span class="course-filter-summary muted-text">全部周次、日期和节次</span>
+      </div>
+      <div class="week-picker course-week-picker" aria-label="选择该课程下载周次"></div>
+      <div class="course-filter-inputs">
+        <label>日期（可选）<input class="course-dates-input" type="text" placeholder="如 9-11,10-16"></label>
+        <label>节次（可选）<input class="course-lessons-input" type="text" placeholder="如 5-6,9"></label>
+      </div>
+    `;
+    panel.classList.toggle("hidden", !filterState.expanded);
+    const summary = panel.querySelector(".course-filter-summary");
+    const datesInput = panel.querySelector(".course-dates-input");
+    const lessonsInput = panel.querySelector(".course-lessons-input");
+    datesInput.value = filterState.dates;
+    lessonsInput.value = filterState.lessons;
+    const updateFilter = () => {
+      const parts = [];
+      if (filterState.weeks.size) {
+        parts.push(`第${[...filterState.weeks].sort((a, b) => a - b).join("、")}周`);
+      }
+      if (filterState.dates.trim()) parts.push(filterState.dates.trim());
+      if (filterState.lessons.trim()) parts.push(`第${filterState.lessons.trim()}节`);
+      summary.textContent = parts.length ? parts.join(" · ") : "全部周次、日期和节次";
+      toggle.textContent = parts.length ? "筛选中" : "全部";
+      toggle.classList.toggle("active-filter", parts.length > 0);
+    };
+    renderWeekPicker(panel.querySelector(".course-week-picker"), filterState.weeks, updateFilter);
+    datesInput.addEventListener("input", () => {
+      filterState.dates = datesInput.value;
+      updateFilter();
+    });
+    lessonsInput.addEventListener("input", () => {
+      filterState.lessons = lessonsInput.value;
+      updateFilter();
+    });
+    toggle.addEventListener("click", () => {
+      filterState.expanded = !filterState.expanded;
+      panel.classList.toggle("hidden", !filterState.expanded);
+    });
+    updateFilter();
+    item.appendChild(row);
+    item.appendChild(panel);
+    list.appendChild(item);
   }
+}
+
+function renderWeekPicker(container, selected, onChange) {
+  container.innerHTML = "";
+  for (let week = 1; week <= 20; week += 1) {
+    const button = document.createElement("button");
+    button.type = "button";
+    button.className = "week-chip";
+    button.dataset.week = String(week);
+    button.textContent = `第${week}周`;
+    button.setAttribute("aria-pressed", selected.has(week) ? "true" : "false");
+    button.addEventListener("click", () => {
+      if (selected.has(week)) selected.delete(week);
+      else selected.add(week);
+      button.setAttribute("aria-pressed", selected.has(week) ? "true" : "false");
+      onChange();
+    });
+    container.appendChild(button);
+  }
+
+  const clear = document.createElement("button");
+  clear.type = "button";
+  clear.className = "week-chip clear-week";
+  clear.textContent = "清空";
+  clear.addEventListener("click", () => {
+    selected.clear();
+    for (const button of $$(".week-chip[data-week]", container)) {
+      button.setAttribute("aria-pressed", "false");
+    }
+    onChange();
+  });
+  container.appendChild(clear);
+}
+
+function setupWeekPicker(containerId, hiddenId, summaryId) {
+  const container = $(containerId);
+  const hidden = $(hiddenId);
+  const summary = $(summaryId);
+  const selected = new Set();
+  const update = () => {
+    const weeks = [...selected].sort((left, right) => left - right);
+    hidden.value = weeks.join(",");
+    summary.textContent = weeks.length ? `已选 ${weeks.length} 周` : "全部周次";
+  };
+  renderWeekPicker(container, selected, update);
+  update();
 }
 
 async function loadAutomation() {
@@ -390,6 +530,9 @@ async function startDownload(payload) {
       method: "POST",
       body: JSON.stringify(payload),
     });
+    rememberDownloadJob(data.job_id);
+    state.outputCursor = -1;
+    state.taskCompletionShown = false;
     connectDownloadStream(data.stream_url, true);
   } catch (err) {
     appendOutput(`启动失败: ${err.message}\n`);
@@ -400,41 +543,145 @@ async function startDownload(payload) {
 
 function connectDownloadStream(streamUrl, resetOutput = false) {
   if (state.outputSource) state.outputSource.close();
+  if (state.outputReconnectTimer) {
+    clearTimeout(state.outputReconnectTimer);
+    state.outputReconnectTimer = null;
+  }
   if (resetOutput) $("terminalOutput").textContent = "";
-  setStatus("运行中", "running");
+  setStatus("连接任务", "running");
   setStreamIndicator("streaming");
-  const source = new EventSource(streamUrl);
+  const separator = streamUrl.includes("?") ? "&" : "?";
+  const resumeUrl = state.outputCursor >= 0 ? `${streamUrl}${separator}after=${state.outputCursor}` : streamUrl;
+  const source = new EventSource(resumeUrl);
   state.outputSource = source;
   source.onmessage = (event) => {
     const item = JSON.parse(event.data);
     appendOutput(item.text || "");
+    if (Number.isInteger(item.cursor)) state.outputCursor = Math.max(state.outputCursor, item.cursor);
   };
+  source.addEventListener("status", (event) => {
+    applyDownloadSnapshot(JSON.parse(event.data));
+  });
   source.addEventListener("done", (event) => {
     const item = JSON.parse(event.data);
-    appendOutput(`\n任务结束：${item.status}\n`);
-    setStatus(item.success ? "完成" : "失败", item.success ? "success" : "error");
+    if (Number.isInteger(item.cursor)) state.outputCursor = Math.max(state.outputCursor, item.cursor);
+    applyDownloadSnapshot(item);
+    if (!state.taskCompletionShown || state.outputCursor === item.cursor) {
+      appendOutput(`\n任务结束：${downloadStatusLabel(item.status)}\n`);
+    }
+    state.taskCompletionShown = true;
     setStreamIndicator("");
     source.close();
     if (state.outputSource === source) state.outputSource = null;
     loadLibrary();
   });
   source.onerror = () => {
-    appendOutput("\n输出流连接中断\n");
+    if (state.outputSource !== source) return;
     source.close();
-    if (state.outputSource === source) state.outputSource = null;
-    setStatus("输出中断", "error");
+    state.outputSource = null;
+    setStatus("连接重试中", "running");
     setStreamIndicator("broken");
+    if (!state.outputReconnectTimer) {
+      state.outputReconnectTimer = setTimeout(recoverDownloadStream, 900);
+    }
   };
+}
+
+async function recoverDownloadStream() {
+  state.outputReconnectTimer = null;
+  if (!state.downloadJobId) return;
+  try {
+    const data = await apiJson(`/api/download/jobs/${state.downloadJobId}`);
+    applyDownloadSnapshot(data);
+    if (data.status === "success" || data.status === "failed") {
+      if (!state.taskCompletionShown) {
+        appendOutput(`\n任务结束：${downloadStatusLabel(data.status)}\n`);
+        state.taskCompletionShown = true;
+      }
+      setStreamIndicator("");
+      loadLibrary();
+      return;
+    }
+    connectDownloadStream(data.stream_url, false);
+  } catch (err) {
+    if (err.status === 404) {
+      state.downloadJobId = null;
+      state.outputCursor = -1;
+      try {
+        localStorage.removeItem("xduclassvideodownloader.downloadJobId");
+      } catch (_storageError) {
+        // Ignore unavailable local storage.
+      }
+      setStatus("空闲");
+      setStreamIndicator("");
+      return;
+    }
+    setStatus("等待任务连接", "running");
+    state.outputReconnectTimer = setTimeout(recoverDownloadStream, 1500);
+  }
+}
+
+async function startCombinedExport(item) {
+  const ppt = item?.tracks?.pptVideo;
+  const teacher = item?.tracks?.teacherTrack;
+  if (!ppt || !teacher) {
+    appendOutput("当前节次缺少两个视角，无法导出。\n");
+    return;
+  }
+  resetOutput();
+  setStreamIndicator("");
+  setStatus("准备导出", "running");
+  try {
+    const data = await apiJson("/api/library/combine", {
+      method: "POST",
+      body: JSON.stringify({
+        ppt_url: ppt.url,
+        teacher_url: teacher.url,
+        ppt_offset: state.pptOffset,
+      }),
+    });
+    rememberDownloadJob(data.job_id);
+    state.outputCursor = -1;
+    state.taskCompletionShown = false;
+    connectDownloadStream(data.stream_url, true);
+  } catch (err) {
+    appendOutput(`导出失败: ${err.message}\n`);
+    setStatus("导出失败", "error");
+    setStreamIndicator("broken");
+  }
 }
 
 async function restoreActiveDownloadStream() {
   try {
     const data = await apiJson("/api/download/active");
-    if (!data.active) return;
-    appendOutput("检测到正在运行的下载任务，已恢复输出串流。\n");
-    connectDownloadStream(data.stream_url, false);
+    if (data.active) {
+      rememberDownloadJob(data.job_id);
+      applyDownloadSnapshot(data);
+      appendOutput("检测到正在运行的任务，已恢复输出串流。\n");
+      connectDownloadStream(data.stream_url, false);
+      return;
+    }
+    let previousJobId = null;
+    try {
+      previousJobId = localStorage.getItem("xduclassvideodownloader.downloadJobId");
+    } catch (_err) {
+      previousJobId = null;
+    }
+    if (!previousJobId) return;
+    const previous = await apiJson(`/api/download/jobs/${previousJobId}`);
+    rememberDownloadJob(previous.id);
+    applyDownloadSnapshot(previous);
   } catch (err) {
-    appendOutput(`恢复下载输出失败: ${err.message}\n`);
+    if (err.status === 404) {
+      state.downloadJobId = null;
+      try {
+        localStorage.removeItem("xduclassvideodownloader.downloadJobId");
+      } catch (_storageError) {
+        // Ignore unavailable local storage.
+      }
+      return;
+    }
+    appendOutput(`恢复下载状态失败: ${err.message}\n`);
   }
 }
 
@@ -459,6 +706,21 @@ async function saveCourseSelection() {
 
 function selectedCourseSections() {
   return $$("input[type=checkbox]:checked", $("courseList")).map((box) => box.dataset.section);
+}
+
+function selectedCourseFilters() {
+  const filters = {};
+  for (const section of selectedCourseSections()) {
+    const item = state.batchCourseFilters[String(section)];
+    if (!item) continue;
+    const weeks = [...item.weeks].sort((left, right) => left - right).join(",");
+    const dates = item.dates.trim();
+    const lessons = item.lessons.trim();
+    if (weeks || dates || lessons) {
+      filters[String(section)] = { weeks, dates, lessons };
+    }
+  }
+  return filters;
 }
 
 async function loadLibrary() {
@@ -510,33 +772,24 @@ function updateVideoLayout() {
   const cards = $$(".video-card", grid);
   if (!cards.length) return;
 
-  const gridStyle = getComputedStyle(grid);
-  const stacked = gridStyle.flexDirection === "column";
-  const gap = Number.parseFloat(gridStyle.columnGap || gridStyle.gap) || 14;
+  const stage = grid.querySelector(".video-stage") || grid;
+  const gap = Number.parseFloat(getComputedStyle(stage).gap) || 14;
   const availableWidth = Math.max(240, grid.clientWidth);
   const playerPanel = document.querySelector(".player-panel");
   const maximized = playerPanel?.classList.contains("maximized");
   const maxHeight = maximized ? Math.max(260, window.innerHeight - 280) : Math.min(460, Math.max(220, window.innerHeight * 0.52));
   const ratios = cards.map((card) => videoRatio(card.querySelector("video")));
 
-  if (stacked || cards.length === 1) {
-    cards.forEach((card, index) => {
-      const ratio = ratios[index];
-      const height = Math.max(120, availableWidth / ratio);
-      card.style.width = "100%";
-      const frame = card.querySelector(".video-frame");
-      frame.style.width = "100%";
-      frame.style.height = `${height.toFixed(3)}px`;
-    });
-    return;
-  }
-
+  const paired = cards.length > 1;
+  stage.classList.toggle("paired", paired);
   const totalRatio = ratios.reduce((sum, ratio) => sum + ratio, 0);
   const usableWidth = Math.max(240, availableWidth - gap * (cards.length - 1));
-  const rowHeight = Math.min(maxHeight, usableWidth / totalRatio);
+  const rowHeight = paired
+    ? Math.min(maxHeight, Math.max(180, usableWidth / totalRatio))
+    : Math.max(120, Math.min(maxHeight, availableWidth / ratios[0]));
+  stage.style.gridTemplateColumns = paired ? ratios.map((ratio) => `${ratio}fr`).join(" ") : "1fr";
   cards.forEach((card, index) => {
-    const width = rowHeight * ratios[index];
-    card.style.width = `${width.toFixed(3)}px`;
+    card.style.width = "100%";
     const frame = card.querySelector(".video-frame");
     frame.style.width = "100%";
     frame.style.height = `${rowHeight.toFixed(3)}px`;
@@ -574,15 +827,22 @@ async function selectLesson(button, item) {
   stopSyncLoop();
   updatePlayerControls();
 
-  const order = ["pptVideo", "teacherTrack"];
+  const order = item.tracks.combined ? ["combined"] : ["pptVideo", "teacherTrack"];
   const availableTracks = order.filter((track) => item.tracks[track]);
   grid.classList.toggle("single-track", availableTracks.length <= 1);
+  const combineButton = $("combineViews");
+  combineButton.disabled = !(item.tracks.pptVideo && item.tracks.teacherTrack);
+  combineButton.onclick = () => startCombinedExport(item);
+  const stage = document.createElement("div");
+  stage.className = `video-stage${availableTracks.length > 1 ? " paired" : ""}`;
+  grid.appendChild(stage);
   for (const track of availableTracks) {
     const card = document.createElement("div");
     card.className = "video-card";
+    const title = track === "combined" ? "双视角合并" : (track === "pptVideo" ? "pptVideo" : "teacherTrack");
     card.innerHTML = `
       <div class="video-card-title">
-        <span class="video-card-title-text">${track === "pptVideo" ? "pptVideo" : "teacherTrack"}</span>
+        <span class="video-card-title-text">${title}</span>
         <div class="video-title-actions">
           <button class="icon-btn small-icon-btn video-mute-btn" type="button" data-video-action="mute" title="静音/取消静音" aria-label="静音/取消静音">
             <svg class="volume-icon" viewBox="0 0 24 24"><path d="M4 9v6h4l5 4V5L8 9H4Z"/><path d="M16 9.5a4 4 0 0 1 0 5"/><path d="M18.5 7a7 7 0 0 1 0 10"/></svg>
@@ -597,7 +857,7 @@ async function selectLesson(button, item) {
         <video preload="metadata" playsinline src="${item.tracks[track].url}"></video>
       </div>
     `;
-    grid.appendChild(card);
+    stage.appendChild(card);
     const video = card.querySelector("video");
     video.dataset.track = track;
     video.playbackRate = state.playbackRate;
@@ -1492,11 +1752,15 @@ on("startSingle", "click", () => startDownload({
   merge: $("singleMerge").checked,
   video_type: $("singleVideoType").value,
   skip_weeks: $("singleSkipWeeks").value.trim(),
+  weeks: $("singleWeeks").value.trim(),
+  dates: $("singleDates").value.trim(),
+  lessons: $("singleLessons").value.trim(),
 }));
 on("startBatch", "click", () => startDownload({
   mode: "batch",
   selected_sections: selectedCourseSections(),
   video_type: $("batchVideoType").value,
+  course_filters: selectedCourseFilters(),
 }));
 on("selectAllCourses", "click", () => {
   $$("input[type=checkbox]", $("courseList")).forEach((box) => { box.checked = true; });
@@ -1532,6 +1796,7 @@ function initializeApp() {
   if (!state.viewerControlsReady) {
     setupViewerControls();
     setupCredentialFields();
+    setupWeekPicker("singleWeekPicker", "singleWeeks", "singleWeekSummary");
     ensureVideoLayoutObserver();
     state.viewerControlsReady = true;
   }

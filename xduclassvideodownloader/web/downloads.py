@@ -6,10 +6,11 @@ import sys
 import threading
 import time
 import uuid
-from typing import Any, Callable, Dict, Iterable, List, Optional, Protocol, Tuple
+from typing import Any, Callable, Dict, Iterable, List, Mapping, Optional, Protocol, Tuple
 
 from ..core import download_course, download_courses
 from ..core.config import AUTOMATION_CONFIG_FILE, safe_read_config
+from ..core.downloader import combine_video_views
 from ..core.models import CourseDownloadOptions
 from ..core.utils import setup_logging
 
@@ -67,7 +68,7 @@ class ThreadBoundStream(io.TextIOBase):
 
 class QueueLogHandler(logging.Handler):
     def __init__(self, emit: Callable[[str], None]) -> None:
-        super().__init__(logging.ERROR)
+        super().__init__(logging.INFO)
         self.emit_output = emit
         self.setFormatter(logging.Formatter("%(levelname)s: %(message)s"))
 
@@ -84,8 +85,11 @@ class DownloadJob:
         self.target = target
         self.args = args
         self.history: List[str] = []
+        self.history_start = 0
+        self.output_count = 0
         self.condition = threading.Condition()
         self.status = "pending"
+        self.state_version = 0
         self.success: Optional[bool] = None
         self.error: Optional[str] = None
         self.started_at: Optional[float] = None
@@ -98,17 +102,45 @@ class DownloadJob:
     def emit_output(self, text: str) -> None:
         with self.condition:
             self.history.append(text)
+            self.output_count += 1
             if len(self.history) > 5000:
+                self.history_start += len(self.history) - 5000
                 self.history = self.history[-5000:]
             self.condition.notify_all()
 
-    def finish(self) -> None:
+    def set_status(
+        self,
+        status: str,
+        *,
+        success: Optional[bool] = None,
+        error: Optional[str] = None,
+    ) -> None:
         with self.condition:
+            self.status = status
+            if success is not None:
+                self.success = success
+            if error is not None:
+                self.error = error
+            self.state_version += 1
             self.condition.notify_all()
 
+    def snapshot(self) -> Dict[str, Any]:
+        with self.condition:
+            return {
+                "id": self.id,
+                "status": self.status,
+                "success": self.success,
+                "error": self.error,
+                "started_at": self.started_at,
+                "finished_at": self.finished_at,
+                "state_version": self.state_version,
+                "output_cursor": self.output_count - 1,
+            }
+
     def _run(self) -> None:
-        self.status = "running"
-        self.started_at = time.time()
+        with self.condition:
+            self.started_at = time.time()
+        self.set_status("running")
         writer = QueueWriter(self.emit_output)
         handler = QueueLogHandler(self.emit_output)
         root = logging.getLogger("xdu")
@@ -119,13 +151,11 @@ class DownloadJob:
         try:
             sys.stdout = stdout_proxy
             sys.stderr = stderr_proxy
-            self.success = bool(self.target(*self.args))
-            self.status = "success" if self.success else "failed"
+            success = bool(self.target(*self.args))
+            self.set_status("success" if success else "failed", success=success)
         except Exception as exc:
-            self.success = False
-            self.error = str(exc)
-            self.status = "failed"
             self.emit_output(f"ERROR: {exc}\n")
+            self.set_status("failed", success=False, error=str(exc))
             logger.exception("WebUI download job failed")
         finally:
             if sys.stdout is stdout_proxy:
@@ -134,8 +164,10 @@ class DownloadJob:
                 sys.stderr = original_stderr
             writer.flush()
             root.removeHandler(handler)
-            self.finished_at = time.time()
-            self.finish()
+            with self.condition:
+                self.finished_at = time.time()
+                self.state_version += 1
+                self.condition.notify_all()
 
 
 class DownloadJobManager:
@@ -171,7 +203,14 @@ class DownloadJobManager:
 
 
 def run_single_download(
-    live_id: str, single: int, merge: bool, video_type: str, skip_weeks_text: str
+    live_id: str,
+    single: int,
+    merge: bool,
+    video_type: str,
+    skip_weeks_text: str,
+    weeks_text: str = "",
+    dates_text: str = "",
+    lessons_text: str = "",
 ) -> bool:
     return download_course(
         CourseDownloadOptions(
@@ -180,14 +219,42 @@ def run_single_download(
             merge=merge,
             video_type=video_type,
             skip_weeks=skip_weeks_text,
+            weeks=weeks_text,
+            dates=dates_text,
+            lessons=lessons_text,
         )
     )
 
 
-def run_batch_download(selected_sections: Iterable[str], video_type: str) -> bool:
+def run_batch_download(
+    selected_sections: Iterable[str],
+    video_type: str,
+    weeks_text: str = "",
+    dates_text: str = "",
+    lessons_text: str = "",
+    course_filters: Optional[Mapping[str, Mapping[str, str]]] = None,
+) -> bool:
     config = safe_read_config(AUTOMATION_CONFIG_FILE)
     selected = {str(section) for section in selected_sections}
-    return download_courses(config, selected_sections=selected, video_type=video_type)
+    filters = {}
+    if weeks_text:
+        filters["weeks"] = weeks_text
+    if dates_text:
+        filters["dates"] = dates_text
+    if lessons_text:
+        filters["lessons"] = lessons_text
+    if course_filters:
+        filters["course_filters"] = course_filters
+    return download_courses(
+        config,
+        selected_sections=selected,
+        video_type=video_type,
+        **filters,
+    )
+
+
+def run_combined_export(ppt_file: str, teacher_file: str, output_file: str, ppt_offset: float = 0.0) -> bool:
+    return combine_video_views(ppt_file, teacher_file, output_file, ppt_offset=ppt_offset)
 
 
 jobs = DownloadJobManager()
@@ -199,5 +266,6 @@ __all__ = [
     "DownloadJobManager",
     "jobs",
     "run_batch_download",
+    "run_combined_export",
     "run_single_download",
 ]
