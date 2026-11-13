@@ -1538,7 +1538,7 @@ def _combine_view_pairs(save_dir: str) -> int:
     """Combine matching view files and remove sources after successful export."""
 
     directory = Path(save_dir)
-    combined_count = 0
+    pairs = []
     for ppt_file in sorted((*directory.glob("*-pptVideo.mp4"), *directory.glob("*-pptVideo.ts"))):
         prefix = ppt_file.name.rsplit("-pptVideo", 1)[0]
         teacher_file = next(
@@ -1555,13 +1555,36 @@ def _combine_view_pairs(save_dir: str) -> int:
         if teacher_file is None:
             continue
         output_file = directory / f"{prefix}-combined.mp4"
-        if combine_video_views(str(ppt_file), str(teacher_file), str(output_file)):
-            for source in (ppt_file, teacher_file):
-                try:
-                    source.unlink()
-                except OSError as exc:
-                    logger.warning(f"删除合并源文件失败: {source}: {exc}")
-            combined_count += 1
+        pairs.append((ppt_file, teacher_file, output_file))
+
+    combined_count = 0
+    if not pairs:
+        return 0
+    with concurrent.futures.ThreadPoolExecutor(
+        max_workers=min(2, len(pairs))
+    ) as executor:
+        future_to_pair = {
+            executor.submit(
+                combine_video_views,
+                str(ppt_file),
+                str(teacher_file),
+                str(output_file),
+            ): (ppt_file, teacher_file, output_file)
+            for ppt_file, teacher_file, output_file in pairs
+        }
+        for future in concurrent.futures.as_completed(future_to_pair):
+            ppt_file, teacher_file, output_file = future_to_pair[future]
+            try:
+                if not future.result():
+                    continue
+                for source in (ppt_file, teacher_file):
+                    try:
+                        source.unlink()
+                    except OSError as exc:
+                        logger.warning(f"删除合并源文件失败: {source}: {exc}")
+                combined_count += 1
+            except Exception as exc:
+                logger.error(f"双视角并行导出失败: {output_file.name}: {exc}")
     return combined_count
 
 
