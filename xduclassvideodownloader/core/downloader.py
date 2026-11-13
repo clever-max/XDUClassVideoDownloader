@@ -1444,7 +1444,7 @@ def combine_video_views(
         "[teacher][ppt]hstack=inputs=2:shortest=1[v]"
     )
     cpu_count = os.cpu_count() or 4
-    decode_threads = max(2, min(4, cpu_count // 6))
+    decode_threads = max(4, min(6, cpu_count // 4))
     encoder_threads = max(4, min(8, cpu_count // 3))
     encoder = _preferred_video_encoder()
     encoders = [encoder]
@@ -1468,7 +1468,7 @@ def combine_video_views(
             command.extend(
                 [
                     "-c:v", "h264_nvenc",
-                    "-preset", "p5",
+                    "-preset", "p4",
                     "-tune", "hq",
                     "-rc", "vbr",
                     "-cq", "28",
@@ -1628,6 +1628,7 @@ def process_rows(
         "subtitles": 0,
         "subtitle_merged": 0,
     }
+    merge_stats_lock = threading.Lock()
 
     logger.info(f"开始处理课程视频 - {course_code} {course_name} ({year}年)")
     logger.info(f"处理模式: {video_type}, 合并: {'启用' if merge else '禁用'}")
@@ -1737,7 +1738,7 @@ def process_rows(
 
         return single_exists, merged_exists
 
-    def process_single_video(video_url, track_type, row):
+    def process_single_video(video_url, track_type, row, merge_now=True):
         """
         处理单个视频的下载和合并逻辑。
 
@@ -1818,11 +1819,9 @@ def process_rows(
                 return result
 
         # 合并逻辑
-        if merge and filepath.exists():
+        if merge_now and merge and filepath.exists():
             try:
-                merged_result = attempt_video_merge(
-                    filepath, track_type, month, date, day_chinese, jie, days, course_code, course_name, year, save_dir
-                )
+                merged_result = attempt_video_merge(filepath, track_type, save_dir)
                 if merged_result:
                     result["merged"] = True
                     logger.info(f"视频合并成功: {filename}")
@@ -1831,9 +1830,7 @@ def process_rows(
 
         return result
 
-    def attempt_video_merge(
-        filepath, track_type, month, date, day_chinese, jie, days, course_code, course_name, year, save_dir
-    ):
+    def attempt_video_merge(filepath, track_type, save_dir):
         """
         尝试将当前视频与相邻节次的视频合并。
 
@@ -1841,7 +1838,15 @@ def process_rows(
             bool: 是否成功合并
         """
         save_path = Path(save_dir)
-        prefix = f"{course_code}{course_name}{year}年{month}月{date}日第{days}周星期{day_chinese}"
+        filename_match = re.match(
+            rf"^(?P<prefix>.+)第(?P<jie>\d+)(?:-\d+)?节-{re.escape(track_type)}\.(?:mp4|ts)$",
+            Path(filepath).name,
+        )
+        if not filename_match:
+            logger.warning(f"无法从文件名解析合并前缀: {filepath}")
+            return False
+        prefix = filename_match.group("prefix")
+        jie = int(filename_match.group("jie"))
         pattern = re.compile(
             rf"{re.escape(prefix)}第(?P<start>\d+)(?:-(?P<end>\d+))?节-{re.escape(track_type)}\.(?:mp4|ts)"
         )
@@ -1888,73 +1893,186 @@ def process_rows(
         logger.info(f"合并视频文件: {[Path(f).name for f in all_files]} -> {merged_filename}")
         merge_success = merge_videos(all_files, str(merged_filepath))
         if merge_success and merge_subtitles_for_videos(all_files, track_type, merged_filepath, video_durations):
-            stats["subtitle_merged"] += 1
+            with merge_stats_lock:
+                stats["subtitle_merged"] += 1
         return merge_success
 
-    # 处理所有视频
+    def find_merge_anchors(track_type):
+        """Return the final source file of each contiguous track segment chain."""
+
+        save_path = Path(save_dir)
+        pattern = re.compile(
+            rf"^(?P<prefix>.+)第(?P<start>\d+)(?:-(?P<end>\d+))?节-"
+            rf"{re.escape(track_type)}\.(?:mp4|ts)$"
+        )
+        best_by_interval = {}
+        for candidate in save_path.iterdir():
+            if not candidate.is_file():
+                continue
+            match = pattern.fullmatch(candidate.name)
+            if not match:
+                continue
+            start = int(match.group("start"))
+            end = int(match.group("end") or start)
+            key = (match.group("prefix"), start, end)
+            existing = best_by_interval.get(key)
+            if (
+                existing is None
+                or (candidate.suffix.lower() == ".mp4" and existing.suffix.lower() != ".mp4")
+                or (
+                    candidate.suffix.lower() == existing.suffix.lower()
+                    and candidate.stat().st_size > existing.stat().st_size
+                )
+            ):
+                best_by_interval[key] = candidate
+
+        grouped = {}
+        for (prefix, start, end), path in best_by_interval.items():
+            grouped.setdefault(prefix, []).append((start, end, path))
+
+        anchors = []
+        for prefix, intervals in grouped.items():
+            intervals.sort(key=lambda item: (item[0], item[1]))
+            chains = []
+            current = []
+            current_end = None
+            for start, end, path in intervals:
+                if current and start <= current_end + 1:
+                    current.append((start, end, path))
+                    current_end = max(current_end, end)
+                else:
+                    if current:
+                        chains.append(current)
+                    current = [(start, end, path)]
+                    current_end = end
+            if current:
+                chains.append(current)
+
+            for chain in chains:
+                if len(chain) < 2:
+                    continue
+                chain_end = max(end for _, end, _ in chain)
+                end_candidates = [item for item in chain if item[1] == chain_end]
+                individual = [item for item in end_candidates if item[0] == item[1]]
+                anchor = max(individual or end_candidates, key=lambda item: item[0])
+                anchors.append(anchor[2])
+        return anchors
+
+    def merge_track(track_type):
+        merged_count = 0
+        for anchor in find_merge_anchors(track_type):
+            try:
+                if attempt_video_merge(anchor, track_type, save_dir):
+                    merged_count += 1
+            except Exception as exc:
+                logger.error(f"{track_type} 合并失败: {anchor.name}: {exc}")
+        return merged_count
+
+    # 处理所有视频。先下载全部课件视角并启动合并，再下载教师视角，使合并与下载重叠。
     total_tasks = 0
+    track_types = []
     if video_type in ["both", "ppt", "combined"]:
         total_tasks += len(rows)
+        track_types.append("pptVideo")
     if video_type in ["both", "teacher", "combined"]:
         total_tasks += len(rows)
+        track_types.append("teacherTrack")
 
     stats["total_videos"] = total_tasks
+    merge_tracks = track_types if merge else []
+    merge_executor = (
+        concurrent.futures.ThreadPoolExecutor(max_workers=min(2, len(merge_tracks)))
+        if merge_tracks
+        else None
+    )
+    merge_futures = {}
 
-    with tqdm(total=total_tasks, desc="处理视频", unit="个") as pbar:
-        for i, row in enumerate(rows):
-            try:
-                logger.debug(f"处理第 {i+1}/{len(rows)} 行数据")
-                _subtitle_path, subtitle_downloaded = download_subtitle_for_row(
-                    row, course_code, course_name, year, save_dir, auth_cookies=auth_cookies
-                )
-                if subtitle_downloaded:
-                    stats["subtitles"] += 1
+    def record_track_result(result, pbar):
+        if result["downloaded"]:
+            stats["downloaded"] += 1
+        if result["skipped"]:
+            stats["skipped"] += 1
+        if result["failed"]:
+            stats["failed"] += 1
+        if result["merged"]:
+            stats["merged"] += 1
+        pbar.update(1)
 
-                if video_type == "combined":
-                    components = get_safe_filename_components(row)
-                    if components:
-                        month, date, day, jie, days, day_chinese = components
-                        combined_name = (
-                            f"{course_code}{course_name}{year}年{month}月{date}日第{days}周"
-                            f"星期{day_chinese}第{jie}节-combined.mp4"
+    try:
+        with tqdm(total=total_tasks, desc="处理视频", unit="个") as pbar:
+            skipped_combined_rows = set()
+
+            # First pass: subtitles and PPT track.
+            for i, row in enumerate(rows):
+                try:
+                    logger.debug(f"处理第 {i+1}/{len(rows)} 行数据")
+                    _subtitle_path, subtitle_downloaded = download_subtitle_for_row(
+                        row, course_code, course_name, year, save_dir, auth_cookies=auth_cookies
+                    )
+                    if subtitle_downloaded:
+                        stats["subtitles"] += 1
+
+                    if video_type == "combined":
+                        components = get_safe_filename_components(row)
+                        if components:
+                            month, date, _day, jie, days, day_chinese = components
+                            combined_name = (
+                                f"{course_code}{course_name}{year}年{month}月{date}日"
+                                f"第{days}周星期{day_chinese}第{jie}节-combined.mp4"
+                            )
+                            combined_path = Path(save_dir) / combined_name
+                            if combined_path.exists() and verify_file_integrity(str(combined_path)):
+                                logger.info(f"双视角合并视频已存在，跳过: {combined_name}")
+                                skipped_combined_rows.add(i)
+                                stats["skipped"] += 2
+                                pbar.update(2)
+                                continue
+
+                    if "pptVideo" in track_types:
+                        result = process_single_video(
+                            row[5], "pptVideo", row, merge_now=False
                         )
-                        combined_path = Path(save_dir) / combined_name
-                        if combined_path.exists() and verify_file_integrity(str(combined_path)):
-                            logger.info(f"双视角合并视频已存在，跳过: {combined_name}")
-                            stats["skipped"] += 1
-                            pbar.update(2)
-                            continue
-
-                # 处理PPT视频
-                if video_type in ["both", "ppt", "combined"]:
-                    result = process_single_video(row[5], "pptVideo", row)
-                    if result["downloaded"]:
-                        stats["downloaded"] += 1
-                    if result["skipped"]:
-                        stats["skipped"] += 1
-                    if result["failed"]:
-                        stats["failed"] += 1
-                    if result["merged"]:
-                        stats["merged"] += 1
+                        record_track_result(result, pbar)
+                except Exception as e:
+                    logger.error(f"处理第 {i+1} 行 PPT 数据时出错: {e}")
+                    stats["failed"] += 1
                     pbar.update(1)
 
-                # 处理教师视频
-                if video_type in ["both", "teacher", "combined"]:
-                    result = process_single_video(row[6], "teacherTrack", row)
-                    if result["downloaded"]:
-                        stats["downloaded"] += 1
-                    if result["skipped"]:
-                        stats["skipped"] += 1
-                    if result["failed"]:
-                        stats["failed"] += 1
-                    if result["merged"]:
-                        stats["merged"] += 1
-                    pbar.update(1)
+            if merge_executor and "pptVideo" in track_types:
+                merge_futures["pptVideo"] = merge_executor.submit(
+                    merge_track, "pptVideo"
+                )
 
-            except Exception as e:
-                logger.error(f"处理第 {i+1} 行数据时出错: {e}")
-                stats["failed"] += 1
-                pbar.update(1)
+            # Second pass: teacher track downloads while PPT merge is running.
+            if "teacherTrack" in track_types:
+                for i, row in enumerate(rows):
+                    if i in skipped_combined_rows:
+                        continue
+                    try:
+                        result = process_single_video(
+                            row[6], "teacherTrack", row, merge_now=False
+                        )
+                        record_track_result(result, pbar)
+                    except Exception as e:
+                        logger.error(f"处理第 {i+1} 行教师数据时出错: {e}")
+                        stats["failed"] += 1
+                        pbar.update(1)
+
+            if merge_executor and "teacherTrack" in track_types:
+                merge_futures["teacherTrack"] = merge_executor.submit(
+                    merge_track, "teacherTrack"
+                )
+    finally:
+        if merge_executor:
+            merge_executor.shutdown(wait=True)
+
+    for track_type, future in merge_futures.items():
+        try:
+            merged_count = future.result()
+            stats["merged"] += merged_count
+            logger.info(f"{track_type} 合并任务完成: {merged_count} 组")
+        except Exception as exc:
+            logger.error(f"{track_type} 合并任务失败: {exc}")
 
     if video_type == "combined":
         stats["combined"] = _combine_view_pairs(save_dir)
