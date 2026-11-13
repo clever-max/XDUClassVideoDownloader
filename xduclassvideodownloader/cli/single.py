@@ -114,11 +114,12 @@ def get_user_input_interactive() -> Optional[InteractiveInput]:
         print("1. 两种都下载（默认）")
         print("2. 仅下载 pptVideo")
         print("3. 仅下载 teacherTrack")
+        print("4. 仅导出双视角合并视频")
 
         video_type_choice = user_input_with_check(
-            "请输入选择（1-3，直接回车选择默认）: ",
-            make_choice_validator("1", "2", "3", allow_empty=True),
-            error_message="选择无效，请输入 1、2、3 或直接回车",
+            "请输入选择（1-4，直接回车选择默认）: ",
+            make_choice_validator("1", "2", "3", "4", allow_empty=True),
+            error_message="选择无效，请输入 1、2、3、4 或直接回车",
             allow_empty=True,
         ).strip()
 
@@ -126,6 +127,8 @@ def get_user_input_interactive() -> Optional[InteractiveInput]:
             video_type = "ppt"
         elif video_type_choice == "3":
             video_type = "teacher"
+        elif video_type_choice == "4":
+            video_type = "combined"
         else:
             video_type = "both"
 
@@ -162,7 +165,7 @@ def get_user_input_interactive() -> Optional[InteractiveInput]:
         mode_desc = {0: "全部视频", 1: "单节课模式", 2: "半节课模式"}
         print(f"下载模式: {mode_desc[single]}")
         print(f"自动合并: {'是' if merge else '否'}")
-        video_type_desc = {"both": "两种都下载", "ppt": "仅 pptVideo", "teacher": "仅 teacherTrack"}
+        video_type_desc = {"both": "两种都下载", "ppt": "仅 pptVideo", "teacher": "仅 teacherTrack", "combined": "仅合并视频"}
         print(f"视频类型: {video_type_desc[video_type]}")
         if skip_weeks_str:
             try:
@@ -218,7 +221,7 @@ def parse_main_arguments() -> Namespace:
     )
     parser.add_argument(
         "--video-type",
-        choices=["both", "ppt", "teacher"],
+        choices=["both", "ppt", "teacher", "combined"],
         default="both",
         help="选择要下载的视频类型：both（两种都下载，默认）、ppt（仅下载 pptVideo）、teacher（仅下载 teacherTrack）",
     )
@@ -230,12 +233,39 @@ def parse_main_arguments() -> Namespace:
         help="跳过特定周数的视频。格式示例：5 (第5周), 1-5 (第1-5周), 1,3,5 (第1、3、5周), 1-3,7,9-11 (组合)",
     )
     parser.add_argument(
+        "--weeks",
+        default="",
+        metavar="WEEKS",
+        help="只下载指定周次，格式与 --skip-weeks 相同",
+    )
+    parser.add_argument(
+        "--dates",
+        default="",
+        metavar="DATES",
+        help="只下载指定月日，格式示例：9-11,10-16",
+    )
+    parser.add_argument(
+        "--lessons",
+        default="",
+        metavar="LESSONS",
+        help="只下载指定节次，格式示例：5-6,9",
+    )
+    parser.add_argument(
         "--debug", action="store_true", dest="debug", default=False, help="启用调试日志（写入 logs/debug.log）"
     )
     return parser.parse_args()
 
 
-def main(liveid: Optional[str] = None, single: int = 0, merge: bool = True, video_type: str = "both", skip_weeks: str = "") -> bool:
+def main(
+    liveid: Optional[str] = None,
+    single: int = 0,
+    merge: bool = True,
+    video_type: str = "both",
+    skip_weeks: str = "",
+    weeks: str = "",
+    dates: str = "",
+    lessons: str = "",
+) -> bool:
     """
     主函数：下载指定课程的视频，包含完整的错误处理和用户体验优化。
 
@@ -263,6 +293,9 @@ def main(liveid: Optional[str] = None, single: int = 0, merge: bool = True, vide
             download_single = input_single
             download_merge = input_merge
             download_video_type = input_video_type
+            download_weeks = ""
+            download_dates = ""
+            download_lessons = ""
         else:
             # 验证命令行参数
             validated_liveid, validated_single, validated_video_type = validate_download_parameters(liveid, single, video_type)
@@ -274,6 +307,9 @@ def main(liveid: Optional[str] = None, single: int = 0, merge: bool = True, vide
             download_merge = merge
             download_video_type = validated_video_type
             download_skip_weeks = skip_weeks
+            download_weeks = weeks
+            download_dates = dates
+            download_lessons = lessons
 
             # 无 command 参数
 
@@ -302,6 +338,9 @@ def main(liveid: Optional[str] = None, single: int = 0, merge: bool = True, vide
                 merge=download_merge,
                 video_type=download_video_type,
                 skip_weeks=download_skip_weeks,
+                weeks=download_weeks,
+                dates=download_dates,
+                lessons=download_lessons,
             )
         )
 
@@ -336,6 +375,9 @@ def run() -> None:
             merge=args.merge,
             video_type=args.video_type,
             skip_weeks=args.skip_weeks,
+            weeks=getattr(args, "weeks", ""),
+            dates=getattr(args, "dates", ""),
+            lessons=getattr(args, "lessons", ""),
         )
         pause_before_exit_if_frozen()
         sys.exit(0 if success else 1)

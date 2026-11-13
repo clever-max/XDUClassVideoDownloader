@@ -65,10 +65,13 @@ def parse_automation_arguments() -> Namespace:
     )
     parser.add_argument(
         "--video-type",
-        choices=["both", "ppt", "teacher"],
+        choices=["both", "ppt", "teacher", "combined"],
         default=None,
         help="选择要下载的视频类型：both（两种都下载，默认）、ppt（仅下载 pptVideo）、teacher（仅下载 teacherTrack）",
     )
+    parser.add_argument("--weeks", default="", metavar="WEEKS", help="只下载指定周次，如 1-3,7")
+    parser.add_argument("--dates", default="", metavar="DATES", help="只下载指定月日，如 9-11,10-16")
+    parser.add_argument("--lessons", default="", metavar="LESSONS", help="只下载指定节次，如 5-6,9")
     parser.add_argument(
         "--debug", action="store_true", dest="debug", default=False, help="启用调试日志（写入 logs/debug.log）"
     )
@@ -158,6 +161,9 @@ def main(args: Optional[Namespace] = None, config_file: Optional[str] = None) ->
             config,
             selected_sections=None,
             video_type=video_type,
+            weeks=getattr(args, "weeks", ""),
+            dates=getattr(args, "dates", ""),
+            lessons=getattr(args, "lessons", ""),
             auth_cookies=auth_cookies,
         )
 
